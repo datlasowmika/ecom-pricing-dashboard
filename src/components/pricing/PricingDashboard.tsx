@@ -301,11 +301,13 @@ function computePriceUploadAverages(enriched: Enriched[]) {
 // ---------- Tooltip ----------
 function Tip({ text, children }: { text: string; children: React.ReactNode }) {
   return (
-    <span className="group relative inline-flex">
+    <span className="group relative inline-flex min-w-0 max-w-full">
       {children}
-      <span className="pointer-events-none absolute bottom-full left-1/2 z-50 mb-1 -translate-x-1/2 whitespace-nowrap rounded-md bg-foreground px-2 py-1 text-[11px] font-medium text-background opacity-0 shadow-lg transition-opacity group-hover:opacity-100">
-        {text}
-      </span>
+      {text ? (
+        <span className="pointer-events-none absolute bottom-full left-1/2 z-50 mb-1 -translate-x-1/2 whitespace-nowrap rounded-md bg-foreground px-2 py-1 text-[11px] font-medium text-background opacity-0 shadow-lg transition-opacity group-hover:opacity-100">
+          {text}
+        </span>
+      ) : null}
     </span>
   );
 }
@@ -322,14 +324,15 @@ function SortHeader({
   return (
     <button
       onClick={onClick}
-      className={`flex w-full items-center gap-1 text-[11px] font-semibold uppercase tracking-wide text-muted-foreground hover:text-foreground ${
+      title={label}
+      className={`flex h-full w-full min-w-0 items-center gap-1 text-[11px] font-semibold uppercase leading-none tracking-wide text-muted-foreground hover:text-foreground ${
         align === "right" ? "justify-end" : "justify-start"
       }`}
     >
-      <span>{label}</span>
-      {!active && <ChevronsUpDown className="h-3 w-3 opacity-50" />}
-      {active && dir === "asc" && <ChevronUp className="h-3 w-3 text-primary" />}
-      {active && dir === "desc" && <ChevronDown className="h-3 w-3 text-primary" />}
+      <span className="min-w-0 truncate">{label}</span>
+      {!active && <ChevronsUpDown className="h-3 w-3 shrink-0 opacity-50" />}
+      {active && dir === "asc" && <ChevronUp className="h-3 w-3 shrink-0 text-primary" />}
+      {active && dir === "desc" && <ChevronDown className="h-3 w-3 shrink-0 text-primary" />}
     </button>
   );
 }
@@ -441,12 +444,31 @@ export function PricingDashboard() {
   const [rejectionReason, setRejectionReason] = useState<string>("");
   const [showFab, setShowFab] = useState(false);
   const [search, setSearch] = useState("");
-  const [violationFilters, setViolationFilters] = useState<Set<string>>(new Set());
-  const [subcategoryFilters, setSubcategoryFilters] = useState<Set<string>>(new Set());
+  const [pendingViolationFilters, setPendingViolationFilters] = useState<Set<string>>(new Set());
+  const [appliedViolationFilters, setAppliedViolationFilters] = useState<Set<string>>(new Set());
+  const [lockedViolationFsnIds, setLockedViolationFsnIds] = useState<Set<string> | null>(null);
+  const [pendingSubcategoryFilters, setPendingSubcategoryFilters] = useState<Set<string>>(new Set());
+  const [appliedSubcategoryFilters, setAppliedSubcategoryFilters] = useState<Set<string>>(new Set());
+  const [lockedSubcategoryFsnIds, setLockedSubcategoryFsnIds] = useState<Set<string> | null>(null);
   const [filterOpen, setFilterOpen] = useState(false);
   const [subcatFilterOpen, setSubcatFilterOpen] = useState(false);
   const [sheetFullscreen, setSheetFullscreen] = useState(false);
   const [tableZoom, setTableZoom] = useState(TABLE_ZOOM_MAX);
+  const {
+    width: frozenPaneWidth,
+    onResizePointerDown: onFrozenResizeDown,
+    onResizePointerMove: onFrozenResizeMove,
+    endResize: endFrozenResize,
+  } = useResizableFrozenWidth(FROZEN_PANE_DEFAULT, FROZEN_PANE_MIN, FROZEN_PANE_MAX);
+
+  useEffect(() => {
+    setPendingViolationFilters(new Set());
+    setAppliedViolationFilters(new Set());
+    setLockedViolationFsnIds(null);
+    setPendingSubcategoryFilters(new Set());
+    setAppliedSubcategoryFilters(new Set());
+    setLockedSubcategoryFsnIds(null);
+  }, [city, deliveryDate]);
 
   useEffect(() => {
     if (!sheetFullscreen) return;
@@ -483,30 +505,66 @@ export function PricingDashboard() {
     [rows, totalDemand]
   );
 
+  const matchesViolationFilters = useCallback((row: SkuRow, calc: ReturnType<typeof deriveRow>, fs: Set<string>) => {
+    if (fs.size === 0) return true;
+    if (fs.has("neg_pi") && calc.piPct !== null && calc.piPct < 0) return true;
+    if (fs.has("neg_gm") && calc.gm !== null && calc.gm < 0) return true;
+    if (fs.has("blank_bk") && row.blinkitSp === null) return true;
+    if (fs.has("missing_grn") && row.grnPricePerKg === null) return true;
+    if (fs.has("has_suggested") && row.suggestedPp !== null) return true;
+    if (fs.has("high_deflection") && isDeflectionOutOfRange(row.priceDeflectionPct)) return true;
+    return false;
+  }, []);
+
+  const applyViolationFilters = useCallback(() => {
+    const fs = new Set(pendingViolationFilters);
+    setAppliedViolationFilters(fs);
+    if (fs.size === 0) {
+      setLockedViolationFsnIds(null);
+    } else {
+      const ids = new Set(
+        enriched
+          .filter(({ row, calc }) => matchesViolationFilters(row, calc, fs))
+          .map(({ row }) => row.fsnId),
+      );
+      setLockedViolationFsnIds(ids);
+    }
+    setFilterOpen(false);
+  }, [pendingViolationFilters, enriched, matchesViolationFilters]);
+
+  const applySubcategoryFilters = useCallback(() => {
+    const subs = new Set(pendingSubcategoryFilters);
+    setAppliedSubcategoryFilters(subs);
+    if (subs.size === 0) {
+      setLockedSubcategoryFsnIds(null);
+    } else {
+      const ids = new Set(
+        enriched
+          .filter(({ row }) => {
+            const sub = resolveSubcategory(row.fsnId, row.ncSkuId, row.subcategory);
+            return !!sub && subs.has(sub);
+          })
+          .map(({ row }) => row.fsnId),
+      );
+      setLockedSubcategoryFsnIds(ids);
+    }
+    setSubcatFilterOpen(false);
+  }, [pendingSubcategoryFilters, enriched, resolveSubcategory]);
+
   const filtered = useMemo(() => {
     const q = search.trim().toLowerCase();
-    const fs = violationFilters;
-    const subs = subcategoryFilters;
-    return enriched.filter(({ row, calc }) => {
+    return enriched.filter(({ row }) => {
       if (q && !(
         row.fsnId.toLowerCase().includes(q) ||
         row.ncSkuId.toLowerCase().includes(q) ||
         row.ncSkuName.toLowerCase().includes(q)
       )) return false;
-      if (subs.size > 0) {
-        const sub = resolveSubcategory(row.fsnId, row.ncSkuId, row.subcategory);
-        if (!sub || !subs.has(sub)) return false;
-      }
-      if (fs.size === 0) return true;
-      if (fs.has("neg_pi") && calc.piPct !== null && calc.piPct < 0) return true;
-      if (fs.has("neg_gm") && calc.gm !== null && calc.gm < 0) return true;
-      if (fs.has("blank_bk") && row.blinkitSp === null) return true;
-      if (fs.has("missing_grn") && row.grnPricePerKg === null) return true;
-      if (fs.has("has_suggested") && row.suggestedPp !== null) return true;
-      if (fs.has("high_deflection") && isDeflectionOutOfRange(row.priceDeflectionPct)) return true;
-      return false;
+      // Filter visibility is locked at Apply time (by FSN id).
+      if (lockedViolationFsnIds !== null && !lockedViolationFsnIds.has(row.fsnId)) return false;
+      if (lockedSubcategoryFsnIds !== null && !lockedSubcategoryFsnIds.has(row.fsnId)) return false;
+      return true;
     });
-  }, [enriched, search, violationFilters, subcategoryFilters, resolveSubcategory]);
+  }, [enriched, search, lockedViolationFsnIds, lockedSubcategoryFsnIds]);
 
   const sorted = useMemo(() => {
     if (!sortKey || !sortDir) return filtered;
@@ -996,13 +1054,16 @@ export function PricingDashboard() {
             </div>
             <div className="relative">
               <button
-                onClick={() => setFilterOpen((o) => !o)}
+                onClick={() => setFilterOpen((o) => {
+                  if (!o) setPendingViolationFilters(new Set(appliedViolationFilters));
+                  return !o;
+                })}
                 className="inline-flex h-8 items-center gap-2 rounded-md border border-input bg-card px-3 text-[12px] font-medium hover:bg-muted"
               >
                 <Filter className="h-3.5 w-3.5 text-muted-foreground" />
                 <span>Filter</span>
                 <span className="rounded-full bg-muted px-1.5 py-0.5 text-[10px] text-muted-foreground">
-                  {violationFilters.size === 0 ? "All SKUs" : `${violationFilters.size} selected`}
+                  {appliedViolationFilters.size === 0 ? "All SKUs" : `${appliedViolationFilters.size} selected`}
                 </span>
                 <ChevronDown className="h-3.5 w-3.5 text-muted-foreground" />
               </button>
@@ -1012,22 +1073,25 @@ export function PricingDashboard() {
                     <span className="text-[11px] font-semibold uppercase tracking-wide text-muted-foreground">Rule Violations</span>
                     <div className="flex items-center gap-2">
                       <button
-                        onClick={() => setViolationFilters(new Set(VIOLATIONS.filter(v => v.key !== "all").map(v => v.key)))}
+                        type="button"
+                        onClick={() => setPendingViolationFilters(new Set(VIOLATIONS.filter(v => v.key !== "all").map(v => v.key)))}
                         className="text-[11px] text-primary hover:underline"
                       >Select All</button>
                       <button
-                        onClick={() => setViolationFilters(new Set())}
+                        type="button"
+                        onClick={() => setPendingViolationFilters(new Set())}
                         className="text-[11px] text-muted-foreground hover:underline"
                       >Clear</button>
                     </div>
                   </div>
                   <div className="flex flex-col">
                     {VIOLATIONS.filter((v) => v.key !== "all").map((v) => {
-                      const checked = violationFilters.has(v.key);
+                      const checked = pendingViolationFilters.has(v.key);
                       return (
                         <button
+                          type="button"
                           key={v.key}
-                          onClick={() => setViolationFilters((s) => { const n = new Set(s); n.has(v.key) ? n.delete(v.key) : n.add(v.key); return n; })}
+                          onClick={() => setPendingViolationFilters((s) => { const n = new Set(s); n.has(v.key) ? n.delete(v.key) : n.add(v.key); return n; })}
                           className="flex items-center gap-2 rounded-sm px-2 py-1.5 text-left text-[12px] hover:bg-muted"
                         >
                           <span className={`grid h-4 w-4 place-items-center rounded-sm border ${checked ? "border-primary bg-primary text-primary-foreground" : "border-input bg-card"}`}>
@@ -1038,68 +1102,86 @@ export function PricingDashboard() {
                       );
                     })}
                   </div>
+                  <div className="mt-2 border-t pt-2">
+                    <button
+                      type="button"
+                      onClick={applyViolationFilters}
+                      className="inline-flex h-8 w-full items-center justify-center rounded-md bg-primary px-3 text-[12px] font-medium text-primary-foreground hover:opacity-90"
+                    >
+                      Apply
+                    </button>
+                  </div>
                 </div>
               )}
             </div>
             <div className="relative">
               <button
-                onClick={() => setSubcatFilterOpen((o) => !o)}
+                onClick={() => setSubcatFilterOpen((o) => {
+                  if (!o) setPendingSubcategoryFilters(new Set(appliedSubcategoryFilters));
+                  return !o;
+                })}
                 className="inline-flex h-8 items-center gap-2 rounded-md border border-input bg-card px-3 text-[12px] font-medium hover:bg-muted"
               >
                 <Layers className="h-3.5 w-3.5 text-muted-foreground" />
                 <span>Subcategory</span>
                 <span className="rounded-full bg-muted px-1.5 py-0.5 text-[10px] text-muted-foreground">
-                  {subcategoryFilters.size === 0 ? "All" : `${subcategoryFilters.size} selected`}
+                  {appliedSubcategoryFilters.size === 0 ? "All" : `${appliedSubcategoryFilters.size} selected`}
                 </span>
                 <ChevronDown className="h-3.5 w-3.5 text-muted-foreground" />
               </button>
               {subcatFilterOpen && (
-                <div className="absolute left-0 top-9 z-50 max-h-72 w-64 overflow-y-auto rounded-md border bg-card p-2 shadow-lg">
-                  <div className="mb-1 flex items-center justify-between px-1">
+                <div className="absolute left-0 top-9 z-50 flex max-h-72 w-64 flex-col rounded-md border bg-card p-2 shadow-lg">
+                  <div className="mb-1 flex shrink-0 items-center justify-between px-1">
                     <span className="text-[11px] font-semibold uppercase tracking-wide text-muted-foreground">Subcategory</span>
                     <div className="flex items-center gap-2">
                       <button
-                        onClick={() => setSubcategoryFilters(new Set(subcategoryOptions))}
+                        type="button"
+                        onClick={() => setPendingSubcategoryFilters(new Set(subcategoryOptions))}
                         className="text-[11px] text-primary hover:underline"
                       >Select All</button>
                       <button
-                        onClick={() => setSubcategoryFilters(new Set())}
+                        type="button"
+                        onClick={() => setPendingSubcategoryFilters(new Set())}
                         className="text-[11px] text-muted-foreground hover:underline"
                       >Clear</button>
                     </div>
                   </div>
-                  <div className="flex flex-col">
-                    {subcategoryOptions.length === 0 ? (
-                      <span className="px-2 py-1.5 text-[12px] text-muted-foreground">No subcategories found</span>
-                    ) : (
-                      subcategoryOptions.map((name) => {
-                        const checked = subcategoryFilters.has(name);
-                        return (
-                          <button
-                            key={name}
-                            onClick={() => setSubcategoryFilters((s) => { const n = new Set(s); n.has(name) ? n.delete(name) : n.add(name); return n; })}
-                            className="flex items-center gap-2 rounded-sm px-2 py-1.5 text-left text-[12px] hover:bg-muted"
-                          >
-                            <span className={`grid h-4 w-4 shrink-0 place-items-center rounded-sm border ${checked ? "border-primary bg-primary text-primary-foreground" : "border-input bg-card"}`}>
-                              {checked && <Check className="h-3 w-3" />}
-                            </span>
-                            <span>{name}</span>
-                          </button>
-                        );
-                      })
-                    )}
+                  <div className="min-h-0 flex-1 overflow-y-auto">
+                    <div className="flex flex-col">
+                      {subcategoryOptions.length === 0 ? (
+                        <span className="px-2 py-1.5 text-[12px] text-muted-foreground">No subcategories found</span>
+                      ) : (
+                        subcategoryOptions.map((name) => {
+                          const checked = pendingSubcategoryFilters.has(name);
+                          return (
+                            <button
+                              type="button"
+                              key={name}
+                              onClick={() => setPendingSubcategoryFilters((s) => { const n = new Set(s); n.has(name) ? n.delete(name) : n.add(name); return n; })}
+                              className="flex items-center gap-2 rounded-sm px-2 py-1.5 text-left text-[12px] hover:bg-muted"
+                            >
+                              <span className={`grid h-4 w-4 shrink-0 place-items-center rounded-sm border ${checked ? "border-primary bg-primary text-primary-foreground" : "border-input bg-card"}`}>
+                                {checked && <Check className="h-3 w-3" />}
+                              </span>
+                              <span>{name}</span>
+                            </button>
+                          );
+                        })
+                      )}
+                    </div>
+                  </div>
+                  <div className="mt-2 shrink-0 border-t pt-2">
+                    <button
+                      type="button"
+                      onClick={applySubcategoryFilters}
+                      className="inline-flex h-8 w-full items-center justify-center rounded-md bg-primary px-3 text-[12px] font-medium text-primary-foreground hover:opacity-90"
+                    >
+                      Apply
+                    </button>
                   </div>
                 </div>
               )}
             </div>
-            {(violationFilters.size > 0 || subcategoryFilters.size > 0) && (
-              <button
-                onClick={() => { setViolationFilters(new Set()); setSubcategoryFilters(new Set()); }}
-                className="text-[11px] text-primary hover:underline"
-              >
-                Clear filters
-              </button>
-            )}
             <span className="ml-auto text-[11px] text-muted-foreground">
               {sorted.length} of {rows.length} SKUs
             </span>
@@ -1111,16 +1193,23 @@ export function PricingDashboard() {
               className={`overflow-auto ${sheetFullscreen ? "min-h-0 flex-1" : "max-h-[calc(100vh-14rem)]"}`}
             >
             <div className="flex w-max min-w-full" style={{ zoom: tableZoom / 100 }}>
-              {/* Frozen — immovable on horizontal scroll */}
-              <div className="sticky left-0 z-30 w-auto shrink-0 border-r-2 border-border bg-card">
-
-
+              {/* Frozen — immovable on horizontal scroll; width adjustable via edge handle */}
+              <div
+                className="relative sticky left-0 z-30 shrink-0 border-r-2 border-border bg-card"
+                style={{ width: frozenPaneWidth }}
+              >
                 <FrozenTable
                   rows={sorted}
                   sortKey={sortKey}
                   sortDir={sortDir}
                   toggleSort={toggleSort}
                   averages={averages}
+                />
+                <FrozenPaneResizeHandle
+                  scale={tableZoom / 100}
+                  onPointerDown={onFrozenResizeDown}
+                  onPointerMove={onFrozenResizeMove}
+                  onPointerUp={endFrozenResize}
                 />
               </div>
               {/* Scrollable */}
@@ -1453,15 +1542,95 @@ function SubCategoryMetricsModal({
 
 
 // ---------- Frozen left table ----------
-const COL_HEAD_H = "h-9";
-const SUB_HEAD_H = "h-7";
-const ROW_H = "h-10";
-const STICKY_GROUP = "sticky top-0 z-20";
+// Keep these in lockstep across FrozenTable + ScrollTable so split panes share one baseline.
+// Group h-6 (24) + col h-9 (36) = 60 → sticky averages top offset.
+const COL_HEAD_H = "h-9 max-h-9";
+const SUB_HEAD_H = "h-7 max-h-7";
+const ROW_H = "h-10 max-h-10";
+const GROUP_HEAD_H = "h-6 max-h-6";
+const HEAD_TH = "h-9 max-h-9 overflow-hidden py-0 align-middle";
+const AVG_TD = "h-7 max-h-7 overflow-hidden py-0 align-middle";
+const GROUP_TH = "h-6 max-h-6 overflow-hidden py-0 align-middle";
+const STICKY_GROUP = "sticky top-0 z-20 bg-muted";
 const STICKY_COL = "sticky top-6 z-20";
 const STICKY_AVG = "sticky top-[60px] z-20";
-const STICKY_FROZEN_GROUP = "sticky top-0 left-0 z-30";
-const STICKY_FROZEN_COL = "sticky top-6 left-0 z-30";
-const STICKY_FROZEN_AVG = "sticky top-[60px] left-0 z-30";
+const STICKY_FROZEN_GROUP = "sticky top-0 z-40";
+const STICKY_FROZEN_COL = "sticky top-6 z-40";
+const STICKY_FROZEN_AVG = "sticky top-[60px] z-40";
+
+const FROZEN_PANE_DEFAULT = 350;
+const FROZEN_PANE_MIN = 160;
+const FROZEN_PANE_MAX = 720;
+const APPROVAL_FROZEN_DEFAULT = 520;
+const APPROVAL_FROZEN_MIN = 240;
+const APPROVAL_FROZEN_MAX = 900;
+
+function useResizableFrozenWidth(defaultWidth: number, minWidth: number, maxWidth: number) {
+  const [width, setWidth] = useState(defaultWidth);
+  const dragRef = useRef<{ startX: number; startW: number; scale: number } | null>(null);
+
+  const onResizePointerDown = useCallback(
+    (e: React.PointerEvent<HTMLElement>, scale = 1) => {
+      e.preventDefault();
+      e.stopPropagation();
+      e.currentTarget.setPointerCapture(e.pointerId);
+      dragRef.current = { startX: e.clientX, startW: width, scale: scale || 1 };
+      document.body.style.cursor = "col-resize";
+      document.body.style.userSelect = "none";
+    },
+    [width],
+  );
+
+  const onResizePointerMove = useCallback(
+    (e: React.PointerEvent<HTMLElement>) => {
+      const d = dragRef.current;
+      if (!d) return;
+      const next = Math.min(
+        maxWidth,
+        Math.max(minWidth, d.startW + (e.clientX - d.startX) / d.scale),
+      );
+      setWidth(next);
+    },
+    [minWidth, maxWidth],
+  );
+
+  const endResize = useCallback(() => {
+    if (!dragRef.current) return;
+    dragRef.current = null;
+    document.body.style.cursor = "";
+    document.body.style.userSelect = "";
+  }, []);
+
+  return { width, onResizePointerDown, onResizePointerMove, endResize };
+}
+
+function FrozenPaneResizeHandle({
+  onPointerDown,
+  onPointerMove,
+  onPointerUp,
+  scale = 1,
+}: {
+  onPointerDown: (e: React.PointerEvent<HTMLElement>, scale?: number) => void;
+  onPointerMove: (e: React.PointerEvent<HTMLElement>) => void;
+  onPointerUp: () => void;
+  scale?: number;
+}) {
+  return (
+    <div
+      role="separator"
+      aria-orientation="vertical"
+      aria-label="Resize frozen columns"
+      title="Drag to resize frozen columns"
+      className="group/fz absolute inset-y-0 right-0 z-40 w-2 translate-x-1/2 cursor-col-resize touch-none"
+      onPointerDown={(e) => onPointerDown(e, scale)}
+      onPointerMove={onPointerMove}
+      onPointerUp={onPointerUp}
+      onPointerCancel={onPointerUp}
+    >
+      <div className="pointer-events-none mx-auto h-full w-0.5 bg-transparent transition-colors group-hover/fz:bg-primary group-active/fz:bg-primary" />
+    </div>
+  );
+}
 
 function GroupBar({ children, className = "" }: { children: React.ReactNode; className?: string }) {
   return (
@@ -1478,23 +1647,23 @@ function FrozenTable({
   averages: ReturnType<typeof computePriceUploadAverages>;
 }) {
   return (
-    <table className="w-auto border-collapse text-[12px] [&_th]:border-r [&_td]:border-r [&_th]:border-border/60 [&_td]:border-border/60 [&_tr>*:last-child]:border-r-0">
+    <table className="w-full table-fixed border-collapse text-[12px] [&_th]:box-border [&_td]:box-border [&_th]:overflow-hidden [&_td]:overflow-hidden [&_th]:border-r [&_td]:border-r [&_th]:border-border/60 [&_td]:border-border/60 [&_tr>*:last-child]:border-r-0">
       <colgroup>
-        <col style={{ width: 110 }} /><col style={{ width: 130 }} /><col style={{ width: 110 }} />
+        <col style={{ width: "31%" }} /><col style={{ width: "38%" }} /><col style={{ width: "31%" }} />
       </colgroup>
       <thead>
-        <tr>
-          <th colSpan={2} className={`${STICKY_FROZEN_GROUP} h-6 border-b bg-muted px-2 text-left text-[10px] font-semibold uppercase tracking-wider text-muted-foreground`}>Basic Information</th>
-          <th colSpan={1} className={`${STICKY_FROZEN_GROUP} h-6 border-b border-l bg-muted px-2 text-left text-[10px] font-semibold uppercase tracking-wider text-muted-foreground`}>Demand Information</th>
+        <tr className={GROUP_HEAD_H}>
+          <th colSpan={2} title="Basic Information" className={`${STICKY_FROZEN_GROUP} ${GROUP_TH} truncate border-b bg-muted px-2 text-left text-[10px] font-semibold uppercase tracking-wider text-muted-foreground`}>Basic Information</th>
+          <th colSpan={1} title="Demand Information" className={`${STICKY_FROZEN_GROUP} ${GROUP_TH} truncate border-b border-l bg-muted px-2 text-left text-[10px] font-semibold uppercase tracking-wider text-muted-foreground`}>Demand Information</th>
         </tr>
         <tr className={`${COL_HEAD_H} border-b`}>
-          <th className={`${STICKY_FROZEN_COL} bg-card px-2 text-left align-middle text-[11px] font-semibold uppercase tracking-wide text-muted-foreground`}>FSN ID</th>
-          <th className={`${STICKY_FROZEN_COL} bg-card px-2 text-left align-middle text-[11px] font-semibold uppercase tracking-wide text-muted-foreground`}>Weight Unit</th>
-          <th className={`${STICKY_FROZEN_COL} border-l bg-card px-2 align-middle`}><SortHeader align="right" label="Total Demand %" active={sortKey==="totalDemandPct"} dir={sortDir} onClick={() => toggleSort("totalDemandPct")} /></th>
+          <th title="FSN ID" className={`${STICKY_FROZEN_COL} ${HEAD_TH} truncate bg-card px-2 text-left text-[11px] font-semibold uppercase tracking-wide text-muted-foreground`}>FSN ID</th>
+          <th title="Weight Unit" className={`${STICKY_FROZEN_COL} ${HEAD_TH} truncate bg-card px-2 text-left text-[11px] font-semibold uppercase tracking-wide text-muted-foreground`}>Weight Unit</th>
+          <th className={`${STICKY_FROZEN_COL} ${HEAD_TH} border-l bg-card px-2`}><SortHeader align="right" label="Total Demand %" active={sortKey==="totalDemandPct"} dir={sortDir} onClick={() => toggleSort("totalDemandPct")} /></th>
         </tr>
         <tr className={`${SUB_HEAD_H} border-b text-[11px] font-medium`}>
-          <td colSpan={2} className={`${STICKY_FROZEN_AVG} bg-accent px-2 text-muted-foreground`}>Averages →</td>
-          <td className={`${STICKY_FROZEN_AVG} border-l bg-accent px-2 text-right tabular-nums`}>{averages.totalDemandPct !== null ? `${averages.totalDemandPct.toFixed(3)}%` : "—"}</td>
+          <td colSpan={2} className={`${STICKY_FROZEN_AVG} ${AVG_TD} truncate bg-accent px-2 text-muted-foreground`}>Averages →</td>
+          <td className={`${STICKY_FROZEN_AVG} ${AVG_TD} truncate border-l bg-accent px-2 text-right tabular-nums`}>{averages.totalDemandPct !== null ? `${averages.totalDemandPct.toFixed(3)}%` : "—"}</td>
         </tr>
       </thead>
       <tbody>
@@ -1509,9 +1678,9 @@ function FrozenTable({
             : "";
           return (
             <tr key={row.fsnId} className={`${ROW_H} border-b last:border-b-0 hover:bg-muted/40 ${rowCls}`}>
-              <td className="whitespace-nowrap px-2 font-mono text-[11px] text-muted-foreground">{row.fsnId}</td>
-              <td className="whitespace-nowrap px-2 text-muted-foreground">{row.weightUnit}</td>
-              <td className="border-l px-2 text-right tabular-nums">{calc.totalDemandPct.toFixed(3)}%</td>
+              <td title={row.fsnId} className="truncate px-2 font-mono text-[11px] text-muted-foreground">{row.fsnId}</td>
+              <td title={row.weightUnit} className="truncate px-2 text-muted-foreground">{row.weightUnit}</td>
+              <td className="truncate border-l px-2 text-right tabular-nums">{calc.totalDemandPct.toFixed(3)}%</td>
             </tr>
           );
         })}
@@ -1534,7 +1703,7 @@ function ScrollTable({
   submitted: boolean;
 }) {
   return (
-    <table className="min-w-[1850px] border-collapse text-[12px] [&_th]:border-r [&_td]:border-r [&_th]:border-border/60 [&_td]:border-border/60 [&_tr>*:last-child]:border-r-0">
+    <table className="min-w-[1850px] border-collapse text-[12px] [&_th]:box-border [&_td]:box-border [&_th]:overflow-hidden [&_td]:overflow-hidden [&_th]:border-r [&_td]:border-r [&_th]:border-border/60 [&_td]:border-border/60 [&_tr>*:last-child]:border-r-0">
       <colgroup>
         {/* Basic Info (scrollable): NC SKU Name, Special Tags, Subcategory, Conv. Factor, Demand Units */}
         <col style={{ width: 200 }} /><col style={{ width: 110 }} /><col style={{ width: 120 }} /><col style={{ width: 100 }} /><col style={{ width: 110 }} />
@@ -1544,66 +1713,66 @@ function ScrollTable({
         <col style={{ width: 90 }} /><col style={{ width: 80 }} /><col style={{ width: 120 }} /><col style={{ width: 120 }} /><col style={{ width: 100 }} /><col style={{ width: 80 }} /><col style={{ width: 80 }} /><col style={{ width: 80 }} /><col style={{ width: 100 }} /><col style={{ width: 110 }} /><col style={{ width: 100 }} /><col style={{ width: 110 }} />
       </colgroup>
       <thead>
-        <tr className="h-6">
-          <th colSpan={1} className={`${STICKY_GROUP} h-6 border-b bg-muted px-2 py-0 text-left text-[10px] font-semibold uppercase tracking-wider text-muted-foreground`}>Basic Information</th>
-          <th colSpan={3} className={`${STICKY_GROUP} h-6 border-b border-l bg-muted px-2 py-0 text-left text-[10px] font-semibold uppercase tracking-wider text-muted-foreground`}>Basic Information (cont.)</th>
-          <th colSpan={1} className={`${STICKY_GROUP} h-6 border-b border-l bg-muted px-2 py-0 text-left text-[10px] font-semibold uppercase tracking-wider text-muted-foreground`}>Demand Information</th>
-          <th colSpan={6} className={`${STICKY_GROUP} h-6 border-b border-l bg-muted px-2 py-0 text-left text-[10px] font-semibold uppercase tracking-wider text-muted-foreground`}>Demand Information</th>
-          <th colSpan={12} className={`${STICKY_GROUP} h-6 border-b border-l bg-muted px-2 py-0 text-left text-[10px] font-semibold uppercase tracking-wider text-muted-foreground`}>Benchmark Information</th>
+        <tr className={GROUP_HEAD_H}>
+          <th colSpan={1} className={`${STICKY_GROUP} ${GROUP_TH} truncate border-b bg-muted px-2 text-left text-[10px] font-semibold uppercase tracking-wider text-muted-foreground`}>Basic Information</th>
+          <th colSpan={3} className={`${STICKY_GROUP} ${GROUP_TH} truncate border-b border-l bg-muted px-2 text-left text-[10px] font-semibold uppercase tracking-wider text-muted-foreground`}>Basic Information (cont.)</th>
+          <th colSpan={1} className={`${STICKY_GROUP} ${GROUP_TH} truncate border-b border-l bg-muted px-2 text-left text-[10px] font-semibold uppercase tracking-wider text-muted-foreground`}>Demand Information</th>
+          <th colSpan={6} className={`${STICKY_GROUP} ${GROUP_TH} truncate border-b border-l bg-muted px-2 text-left text-[10px] font-semibold uppercase tracking-wider text-muted-foreground`}>Demand Information</th>
+          <th colSpan={12} className={`${STICKY_GROUP} ${GROUP_TH} truncate border-b border-l bg-muted px-2 text-left text-[10px] font-semibold uppercase tracking-wider text-muted-foreground`}>Benchmark Information</th>
         </tr>
 
         <tr className={`${COL_HEAD_H} border-b`}>
           {/* Basic Info (scrollable) */}
-          <th className={`${STICKY_COL} bg-card px-2 text-left align-middle text-[11px] font-semibold uppercase tracking-wide text-muted-foreground`}>NC SKU Name</th>
-          <th className={`${STICKY_COL} border-l bg-card px-2 text-left align-middle text-[11px] font-semibold uppercase tracking-wide text-muted-foreground`}>Special Tags</th>
-          <th className={`${STICKY_COL} bg-card px-2 text-left align-middle text-[11px] font-semibold uppercase tracking-wide text-muted-foreground`}>Subcategory</th>
-          <th className={`${STICKY_COL} bg-card px-2 text-right align-middle text-[11px] font-semibold uppercase tracking-wide text-muted-foreground`}>Conv. Factor</th>
-          <th className={`${STICKY_COL} border-l bg-card px-2 align-middle`}><SortHeader align="right" label="Demand Units" active={sortKey==="demandUnits"} dir={sortDir} onClick={() => toggleSort("demandUnits")} /></th>
+          <th title="NC SKU Name" className={`${STICKY_COL} ${HEAD_TH} truncate bg-card px-2 text-left text-[11px] font-semibold uppercase tracking-wide text-muted-foreground`}>NC SKU Name</th>
+          <th title="Special Tags" className={`${STICKY_COL} ${HEAD_TH} truncate border-l bg-card px-2 text-left text-[11px] font-semibold uppercase tracking-wide text-muted-foreground`}>Special Tags</th>
+          <th title="Subcategory" className={`${STICKY_COL} ${HEAD_TH} truncate bg-card px-2 text-left text-[11px] font-semibold uppercase tracking-wide text-muted-foreground`}>Subcategory</th>
+          <th title="Conv. Factor" className={`${STICKY_COL} ${HEAD_TH} truncate bg-card px-2 text-right text-[11px] font-semibold uppercase tracking-wide text-muted-foreground`}>Conv. Factor</th>
+          <th className={`${STICKY_COL} ${HEAD_TH} border-l bg-card px-2`}><SortHeader align="right" label="Demand Units" active={sortKey==="demandUnits"} dir={sortDir} onClick={() => toggleSort("demandUnits")} /></th>
           {/* Demand Info */}
-          <th className={`${STICKY_COL} bg-card px-2 align-middle`}><SortHeader align="right" label="NLC Value Mix" active={sortKey==="nlcValueMix"} dir={sortDir} onClick={() => toggleSort("nlcValueMix")} /></th>
-          <th className={`${STICKY_COL} bg-card px-2 align-middle`}><SortHeader align="right" label="GRN ₹/kg" active={sortKey==="grnPricePerKg"} dir={sortDir} onClick={() => toggleSort("grnPricePerKg")} /></th>
-          <th className={`${STICKY_COL} bg-card px-2 align-middle text-right text-[11px] font-semibold uppercase tracking-wide text-muted-foreground`}><Tip text="GRN ₹/unit on day T-n-1 (previous day). Read-only.">Prev Day GRN ₹/unit</Tip></th>
-          <th className={`${STICKY_COL} bg-card px-2 align-middle`}><SortHeader align="right" label="GRN ₹/unit" active={sortKey==="grnPerUnit"} dir={sortDir} onClick={() => toggleSort("grnPerUnit")} /></th>
-          <th className={`${STICKY_COL} bg-card px-2 align-middle text-right text-[11px] font-semibold uppercase tracking-wide text-muted-foreground`}><Tip text="(GRN ₹/unit + Adjusted GRN) − Prev Day GRN ₹/unit">GRN Diff</Tip></th>
-          <th className={`${STICKY_COL} bg-card px-2 align-middle`}><SortHeader align="right" label="Adjusted GRN" active={sortKey==="adjustedGrn"} dir={sortDir} onClick={() => toggleSort("adjustedGrn")} /></th>
+          <th className={`${STICKY_COL} ${HEAD_TH} bg-card px-2`}><SortHeader align="right" label="NLC Value Mix" active={sortKey==="nlcValueMix"} dir={sortDir} onClick={() => toggleSort("nlcValueMix")} /></th>
+          <th className={`${STICKY_COL} ${HEAD_TH} bg-card px-2`}><SortHeader align="right" label="GRN ₹/kg" active={sortKey==="grnPricePerKg"} dir={sortDir} onClick={() => toggleSort("grnPricePerKg")} /></th>
+          <th title="Prev Day GRN ₹/unit" className={`${STICKY_COL} ${HEAD_TH} bg-card px-2 text-right text-[11px] font-semibold uppercase tracking-wide text-muted-foreground`}><Tip text="GRN ₹/unit on day T-n-1 (previous day). Read-only."><span className="block truncate">Prev Day GRN ₹/unit</span></Tip></th>
+          <th className={`${STICKY_COL} ${HEAD_TH} bg-card px-2`}><SortHeader align="right" label="GRN ₹/unit" active={sortKey==="grnPerUnit"} dir={sortDir} onClick={() => toggleSort("grnPerUnit")} /></th>
+          <th title="GRN Diff" className={`${STICKY_COL} ${HEAD_TH} bg-card px-2 text-right text-[11px] font-semibold uppercase tracking-wide text-muted-foreground`}><Tip text="(GRN ₹/unit + Adjusted GRN) − Prev Day GRN ₹/unit"><span className="block truncate">GRN Diff</span></Tip></th>
+          <th className={`${STICKY_COL} ${HEAD_TH} bg-card px-2`}><SortHeader align="right" label="Adjusted GRN" active={sortKey==="adjustedGrn"} dir={sortDir} onClick={() => toggleSort("adjustedGrn")} /></th>
           {/* Benchmark Info */}
-          <th className={`${STICKY_COL} border-l bg-card px-2 align-middle`}><SortHeader align="right" label="Blinkit SP" active={sortKey==="blinkitSp"} dir={sortDir} onClick={() => toggleSort("blinkitSp")} /></th>
-          <th className={`${STICKY_COL} bg-card px-2 align-middle text-center text-[11px] font-semibold uppercase tracking-wide text-muted-foreground`}>WSP Trend</th>
-          <th className={`${STICKY_COL} bg-card px-2 align-middle`}><SortHeader align="right" label="Quoted PP" active={sortKey==="quotedPp"} dir={sortDir} onClick={() => toggleSort("quotedPp")} /></th>
-          <th className={`${STICKY_COL} bg-card px-2 align-middle`}><SortHeader align="right" label="Negotiated PP" active={sortKey==="negotiatedPp"} dir={sortDir} onClick={() => toggleSort("negotiatedPp")} /></th>
-          <th className={`${STICKY_COL} bg-card px-2 align-middle text-right text-[11px] font-semibold uppercase tracking-wide text-muted-foreground`}>Suggested PP</th>
-          <th className={`${STICKY_COL} bg-card px-2 align-middle`}><SortHeader align="right" label="NLC" active={sortKey==="nlc"} dir={sortDir} onClick={() => toggleSort("nlc")} /></th>
-          <th className={`${STICKY_COL} bg-card px-2 align-middle`}><SortHeader align="right" label="PI %" active={sortKey==="piPct"} dir={sortDir} onClick={() => toggleSort("piPct")} /></th>
-          <th className={`${STICKY_COL} bg-card px-2 align-middle`}><SortHeader align="right" label="GM" active={sortKey==="gm"} dir={sortDir} onClick={() => toggleSort("gm")} /></th>
-          <th className={`${STICKY_COL} bg-card px-2 align-middle`}><SortHeader align="right" label="Deflection %" active={sortKey==="priceDeflectionPct"} dir={sortDir} onClick={() => toggleSort("priceDeflectionPct")} /></th>
-          <th className={`${STICKY_COL} bg-card px-2 align-middle`}><SortHeader align="right" label="Impact PP Diff" active={sortKey==="impactPpDiff"} dir={sortDir} onClick={() => toggleSort("impactPpDiff")} /></th>
-          <th className={`${STICKY_COL} bg-card px-2 align-middle`}><SortHeader align="right" label="Impact GM" active={sortKey==="impactGm"} dir={sortDir} onClick={() => toggleSort("impactGm")} /></th>
-          <th className={`${STICKY_COL} bg-card px-2 align-middle`}><SortHeader align="right" label="BK Value Mix" active={sortKey==="valueMix"} dir={sortDir} onClick={() => toggleSort("valueMix")} /></th>
+          <th className={`${STICKY_COL} ${HEAD_TH} border-l bg-card px-2`}><SortHeader align="right" label="Blinkit SP" active={sortKey==="blinkitSp"} dir={sortDir} onClick={() => toggleSort("blinkitSp")} /></th>
+          <th title="WSP Trend" className={`${STICKY_COL} ${HEAD_TH} truncate bg-card px-2 text-center text-[11px] font-semibold uppercase tracking-wide text-muted-foreground`}>WSP Trend</th>
+          <th className={`${STICKY_COL} ${HEAD_TH} bg-card px-2`}><SortHeader align="right" label="Quoted PP" active={sortKey==="quotedPp"} dir={sortDir} onClick={() => toggleSort("quotedPp")} /></th>
+          <th className={`${STICKY_COL} ${HEAD_TH} bg-card px-2`}><SortHeader align="right" label="Negotiated PP" active={sortKey==="negotiatedPp"} dir={sortDir} onClick={() => toggleSort("negotiatedPp")} /></th>
+          <th title="Suggested PP" className={`${STICKY_COL} ${HEAD_TH} truncate bg-card px-2 text-right text-[11px] font-semibold uppercase tracking-wide text-muted-foreground`}>Suggested PP</th>
+          <th className={`${STICKY_COL} ${HEAD_TH} bg-card px-2`}><SortHeader align="right" label="NLC" active={sortKey==="nlc"} dir={sortDir} onClick={() => toggleSort("nlc")} /></th>
+          <th className={`${STICKY_COL} ${HEAD_TH} bg-card px-2`}><SortHeader align="right" label="PI %" active={sortKey==="piPct"} dir={sortDir} onClick={() => toggleSort("piPct")} /></th>
+          <th className={`${STICKY_COL} ${HEAD_TH} bg-card px-2`}><SortHeader align="right" label="GM" active={sortKey==="gm"} dir={sortDir} onClick={() => toggleSort("gm")} /></th>
+          <th className={`${STICKY_COL} ${HEAD_TH} bg-card px-2`}><SortHeader align="right" label="Deflection %" active={sortKey==="priceDeflectionPct"} dir={sortDir} onClick={() => toggleSort("priceDeflectionPct")} /></th>
+          <th className={`${STICKY_COL} ${HEAD_TH} bg-card px-2`}><SortHeader align="right" label="Impact PP Diff" active={sortKey==="impactPpDiff"} dir={sortDir} onClick={() => toggleSort("impactPpDiff")} /></th>
+          <th className={`${STICKY_COL} ${HEAD_TH} bg-card px-2`}><SortHeader align="right" label="Impact GM" active={sortKey==="impactGm"} dir={sortDir} onClick={() => toggleSort("impactGm")} /></th>
+          <th className={`${STICKY_COL} ${HEAD_TH} bg-card px-2`}><SortHeader align="right" label="BK Value Mix" active={sortKey==="valueMix"} dir={sortDir} onClick={() => toggleSort("valueMix")} /></th>
         </tr>
         {/* Averages */}
         <tr className={`${SUB_HEAD_H} border-b text-[11px] font-medium`}>
-          <td colSpan={1} className={`${STICKY_AVG} bg-accent px-2 text-muted-foreground`}>Averages →</td>
-          <td colSpan={3} className={`${STICKY_AVG} border-l bg-accent px-2 text-muted-foreground`}>Averages →</td>
-          <td className={`${STICKY_AVG} border-l bg-accent px-2 text-right tabular-nums`}>{averages.demandUnits !== null ? Math.round(averages.demandUnits).toLocaleString() : "—"}</td>
-          <td className={`${STICKY_AVG} bg-accent px-2 text-right tabular-nums`}>{averages.nlcValueMix !== null ? `₹${Math.round(averages.nlcValueMix).toLocaleString()}` : "—"}</td>
-          <td className={`${STICKY_AVG} bg-accent px-2 text-right tabular-nums`}>{fmt(averages.grnPricePerKg)}</td>
-          <td className={`${STICKY_AVG} bg-accent px-2 text-right tabular-nums`}>{fmt(averages.prevDayGrnPerUnit)}</td>
-          <td className={`${STICKY_AVG} bg-accent px-2 text-right tabular-nums`}>{fmt(averages.grnPerUnit)}</td>
-          <td className={`${STICKY_AVG} bg-accent px-2 text-right tabular-nums`}>{averages.grnDiff !== null ? `${averages.grnDiff >= 0 ? "+" : ""}${averages.grnDiff.toFixed(2)}` : "—"}</td>
-          <td className={`${STICKY_AVG} bg-accent px-2 text-right tabular-nums`}>{averages.adjustedGrn !== null ? `${averages.adjustedGrn >= 0 ? "+" : ""}${averages.adjustedGrn.toFixed(2)}` : "—"}</td>
+          <td colSpan={1} className={`${STICKY_AVG} ${AVG_TD} bg-accent px-2 text-muted-foreground`}>Averages →</td>
+          <td colSpan={3} className={`${STICKY_AVG} ${AVG_TD} border-l bg-accent px-2 text-muted-foreground`}>Averages →</td>
+          <td className={`${STICKY_AVG} ${AVG_TD} border-l bg-accent px-2 text-right tabular-nums`}>{averages.demandUnits !== null ? Math.round(averages.demandUnits).toLocaleString() : "—"}</td>
+          <td className={`${STICKY_AVG} ${AVG_TD} bg-accent px-2 text-right tabular-nums`}>{averages.nlcValueMix !== null ? `₹${Math.round(averages.nlcValueMix).toLocaleString()}` : "—"}</td>
+          <td className={`${STICKY_AVG} ${AVG_TD} bg-accent px-2 text-right tabular-nums`}>{fmt(averages.grnPricePerKg)}</td>
+          <td className={`${STICKY_AVG} ${AVG_TD} bg-accent px-2 text-right tabular-nums`}>{fmt(averages.prevDayGrnPerUnit)}</td>
+          <td className={`${STICKY_AVG} ${AVG_TD} bg-accent px-2 text-right tabular-nums`}>{fmt(averages.grnPerUnit)}</td>
+          <td className={`${STICKY_AVG} ${AVG_TD} bg-accent px-2 text-right tabular-nums`}>{averages.grnDiff !== null ? `${averages.grnDiff >= 0 ? "+" : ""}${averages.grnDiff.toFixed(2)}` : "—"}</td>
+          <td className={`${STICKY_AVG} ${AVG_TD} bg-accent px-2 text-right tabular-nums`}>{averages.adjustedGrn !== null ? `${averages.adjustedGrn >= 0 ? "+" : ""}${averages.adjustedGrn.toFixed(2)}` : "—"}</td>
           {/* Benchmark */}
-          <td className={`${STICKY_AVG} border-l bg-accent px-2 text-right tabular-nums`}>{fmt(averages.blinkitSp)}</td>
-          <td className={`${STICKY_AVG} bg-accent px-2 text-center text-muted-foreground`}>—</td>
-          <td className={`${STICKY_AVG} bg-accent px-2 text-right tabular-nums`}>{fmt(averages.quotedPp)}</td>
-          <td className={`${STICKY_AVG} bg-accent px-2 text-right tabular-nums`}>{fmt(averages.negotiatedPp)}</td>
-          <td className={`${STICKY_AVG} bg-accent px-2 text-right tabular-nums`}>{fmt(averages.suggestedPp)}</td>
-          <td className={`${STICKY_AVG} bg-accent px-2 text-right tabular-nums`}>{fmt(averages.nlc)}</td>
-          <td className={`${STICKY_AVG} bg-accent px-2 text-right tabular-nums`}>{num(averages.piPct)}%</td>
-          <td className={`${STICKY_AVG} bg-accent px-2 text-right tabular-nums`}>{fmt(averages.gm)}</td>
-          <td className={`${STICKY_AVG} bg-accent px-2 text-right tabular-nums`}>{num(averages.priceDeflectionPct)}%</td>
-          <td className={`${STICKY_AVG} bg-accent px-2 text-right tabular-nums`}>{fmt(averages.impactPpDiff)}</td>
-          <td className={`${STICKY_AVG} bg-accent px-2 text-right tabular-nums`}>{fmt(averages.impactGm)}</td>
-          <td className={`${STICKY_AVG} bg-accent px-2 text-right tabular-nums`}>{averages.valueMix !== null ? `₹${Math.round(averages.valueMix).toLocaleString()}` : "—"}</td>
+          <td className={`${STICKY_AVG} ${AVG_TD} border-l bg-accent px-2 text-right tabular-nums`}>{fmt(averages.blinkitSp)}</td>
+          <td className={`${STICKY_AVG} ${AVG_TD} bg-accent px-2 text-center text-muted-foreground`}>—</td>
+          <td className={`${STICKY_AVG} ${AVG_TD} bg-accent px-2 text-right tabular-nums`}>{fmt(averages.quotedPp)}</td>
+          <td className={`${STICKY_AVG} ${AVG_TD} bg-accent px-2 text-right tabular-nums`}>{fmt(averages.negotiatedPp)}</td>
+          <td className={`${STICKY_AVG} ${AVG_TD} bg-accent px-2 text-right tabular-nums`}>{fmt(averages.suggestedPp)}</td>
+          <td className={`${STICKY_AVG} ${AVG_TD} bg-accent px-2 text-right tabular-nums`}>{fmt(averages.nlc)}</td>
+          <td className={`${STICKY_AVG} ${AVG_TD} bg-accent px-2 text-right tabular-nums`}>{num(averages.piPct)}%</td>
+          <td className={`${STICKY_AVG} ${AVG_TD} bg-accent px-2 text-right tabular-nums`}>{fmt(averages.gm)}</td>
+          <td className={`${STICKY_AVG} ${AVG_TD} bg-accent px-2 text-right tabular-nums`}>{num(averages.priceDeflectionPct)}%</td>
+          <td className={`${STICKY_AVG} ${AVG_TD} bg-accent px-2 text-right tabular-nums`}>{fmt(averages.impactPpDiff)}</td>
+          <td className={`${STICKY_AVG} ${AVG_TD} bg-accent px-2 text-right tabular-nums`}>{fmt(averages.impactGm)}</td>
+          <td className={`${STICKY_AVG} ${AVG_TD} bg-accent px-2 text-right tabular-nums`}>{averages.valueMix !== null ? `₹${Math.round(averages.valueMix).toLocaleString()}` : "—"}</td>
         </tr>
       </thead>
 
@@ -2655,6 +2824,12 @@ function PriceApprovalTab({
   const [localReason, setLocalReason] = useState("");
   const [sortKey, setSortKey] = useState<string | null>(null);
   const [sortDir, setSortDir] = useState<SortDir>(null);
+  const {
+    width: frozenPaneWidth,
+    onResizePointerDown: onFrozenResizeDown,
+    onResizePointerMove: onFrozenResizeMove,
+    endResize: endFrozenResize,
+  } = useResizableFrozenWidth(APPROVAL_FROZEN_DEFAULT, APPROVAL_FROZEN_MIN, APPROVAL_FROZEN_MAX);
   const toggleSort = (key: string) => {
     if (sortKey !== key) { setSortKey(key); setSortDir("asc"); return; }
     setSortDir((d) => (d === "asc" ? "desc" : "asc"));
@@ -2938,8 +3113,16 @@ function PriceApprovalTab({
       {/* Table */}
       <div className="overflow-hidden rounded-md border bg-card">
         <div className="flex">
-          <div className="w-1/2 shrink-0 overflow-hidden border-r-2 border-border bg-card">
+          <div
+            className="relative shrink-0 border-r-2 border-border bg-card"
+            style={{ width: frozenPaneWidth }}
+          >
             <ApprovalFrozenTable rows={sorted} violationOf={violationOf} averages={avgs} sortKey={sortKey} sortDir={sortDir} toggleSort={toggleSort} />
+            <FrozenPaneResizeHandle
+              onPointerDown={onFrozenResizeDown}
+              onPointerMove={onFrozenResizeMove}
+              onPointerUp={endFrozenResize}
+            />
           </div>
           <div className="min-w-0 flex-1 overflow-x-auto">
             <ApprovalScrollTable
@@ -3170,7 +3353,7 @@ function ApprovalFrozenTable({
   sortKey: string | null; sortDir: SortDir; toggleSort: (k: string) => void;
 }) {
   return (
-    <table className="w-full table-fixed border-collapse text-[12px] [&_th]:border-r [&_td]:border-r [&_th]:border-border/60 [&_td]:border-border/60 [&_th]:align-middle [&_td]:align-middle [&_tr>*:last-child]:border-r-0">
+    <table className="w-full table-fixed border-collapse text-[12px] [&_th]:overflow-hidden [&_td]:overflow-hidden [&_th]:border-r [&_td]:border-r [&_th]:border-border/60 [&_td]:border-border/60 [&_th]:align-middle [&_td]:align-middle [&_tr>*:last-child]:border-r-0">
       <colgroup>
         <col style={{ width: "14%" }} />
         <col style={{ width: "40%" }} />
@@ -3182,19 +3365,19 @@ function ApprovalFrozenTable({
 
       <thead className="sticky top-0 z-10 bg-card">
         <tr>
-          <th colSpan={4} className="h-6 border-b bg-muted px-2 text-left text-[10px] font-semibold uppercase tracking-wider text-muted-foreground">SKU Info</th>
-          <th colSpan={1} className="h-6 border-b bg-muted px-2 text-left text-[10px] font-semibold uppercase tracking-wider text-muted-foreground">Demand</th>
+          <th colSpan={4} title="SKU Info" className="h-6 truncate border-b bg-muted px-2 text-left text-[10px] font-semibold uppercase tracking-wider text-muted-foreground">SKU Info</th>
+          <th colSpan={1} title="Demand" className="h-6 truncate border-b bg-muted px-2 text-left text-[10px] font-semibold uppercase tracking-wider text-muted-foreground">Demand</th>
         </tr>
         <tr className={`${COL_HEAD_H} border-b bg-card`}>
-          <th className="px-2"><SortHeader label="FSN ID" active={sortKey==="fsnId"} dir={sortDir} onClick={() => toggleSort("fsnId")} /></th>
-          <th className="px-2"><SortHeader label="Weight Unit" active={sortKey==="weightUnit"} dir={sortDir} onClick={() => toggleSort("weightUnit")} /></th>
-          <th className="px-2"><SortHeader label="NC SKU ID" active={sortKey==="ncSkuId"} dir={sortDir} onClick={() => toggleSort("ncSkuId")} /></th>
-          <th className="px-2"><SortHeader label="Subcategory" active={sortKey==="subcategory"} dir={sortDir} onClick={() => toggleSort("subcategory")} /></th>
-          <th className="px-2"><SortHeader align="right" label="Demand %" active={sortKey==="totalDemandPct"} dir={sortDir} onClick={() => toggleSort("totalDemandPct")} /></th>
+          <th className="overflow-hidden px-2"><SortHeader label="FSN ID" active={sortKey==="fsnId"} dir={sortDir} onClick={() => toggleSort("fsnId")} /></th>
+          <th className="overflow-hidden px-2"><SortHeader label="Weight Unit" active={sortKey==="weightUnit"} dir={sortDir} onClick={() => toggleSort("weightUnit")} /></th>
+          <th className="overflow-hidden px-2"><SortHeader label="NC SKU ID" active={sortKey==="ncSkuId"} dir={sortDir} onClick={() => toggleSort("ncSkuId")} /></th>
+          <th className="overflow-hidden px-2"><SortHeader label="Subcategory" active={sortKey==="subcategory"} dir={sortDir} onClick={() => toggleSort("subcategory")} /></th>
+          <th className="overflow-hidden px-2"><SortHeader align="right" label="Demand %" active={sortKey==="totalDemandPct"} dir={sortDir} onClick={() => toggleSort("totalDemandPct")} /></th>
         </tr>
         <tr className={`${SUB_HEAD_H} border-b bg-accent/30 text-[11px] font-medium`}>
-          <td colSpan={4} className="px-2 text-muted-foreground">Averages →</td>
-          <td className="px-2 text-right tabular-nums">{averages.totalDemandPct !== null ? `${averages.totalDemandPct.toFixed(3)}%` : "—"}</td>
+          <td colSpan={4} className="truncate px-2 text-muted-foreground">Averages →</td>
+          <td className="truncate px-2 text-right tabular-nums">{averages.totalDemandPct !== null ? `${averages.totalDemandPct.toFixed(3)}%` : "—"}</td>
         </tr>
       </thead>
       <tbody>
