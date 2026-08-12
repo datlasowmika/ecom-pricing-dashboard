@@ -3,6 +3,18 @@
 // - toCSV: escapes values properly.
 
 export function parseCSV(text: string): Record<string, string>[] {
+  const rows = parseCSVMatrix(text);
+  if (rows.length === 0) return [];
+  const header = rows[0].map((h) => h.trim());
+  return rows.slice(1).map((r) => {
+    const obj: Record<string, string> = {};
+    header.forEach((h, i) => { obj[h] = (r[i] ?? "").trim(); });
+    return obj;
+  });
+}
+
+/** Parse CSV into a raw matrix (including header row). Preserves column positions. */
+export function parseCSVMatrix(text: string): string[][] {
   const rows: string[][] = [];
   let cur: string[] = [];
   let field = "";
@@ -26,13 +38,7 @@ export function parseCSV(text: string): Record<string, string>[] {
     }
   }
   if (field !== "" || cur.length) { cur.push(field); rows.push(cur); }
-  if (rows.length === 0) return [];
-  const header = rows[0].map((h) => h.trim());
-  return rows.slice(1).map((r) => {
-    const obj: Record<string, string> = {};
-    header.forEach((h, i) => { obj[h] = (r[i] ?? "").trim(); });
-    return obj;
-  });
+  return rows;
 }
 
 export function toCSV(rows: Record<string, unknown>[], headers?: string[]): string {

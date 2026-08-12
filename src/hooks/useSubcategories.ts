@@ -23,7 +23,7 @@ export function useSubcategories() {
     }
 
     const { data: fallback } = await supabase
-      .from("pricing_sheet")
+      .from("price_sheet_details")
       .select("subcategory, sku_id, fsn_id")
       .not("subcategory", "is", null)
       .not("sku_id", "is", null)

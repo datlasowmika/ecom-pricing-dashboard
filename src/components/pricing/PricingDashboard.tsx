@@ -1,9 +1,22 @@
-import { useMemo, useState, useEffect, useRef, useCallback, type MouseEvent as ReactMouseEvent } from "react";
+import {
+  Fragment,
+  useMemo,
+  useState,
+  useEffect,
+  useLayoutEffect,
+  useRef,
+  useCallback,
+  type CSSProperties,
+  type MouseEvent as ReactMouseEvent,
+} from "react";
+import { createPortal } from "react-dom";
 import { supabase, type PricingSheetRow } from "@/lib/supabase";
+import { priceSheetHeaderExists } from "@/lib/priceSheetDb";
 import { usePricingSheet } from "@/hooks/usePricingSheet";
 import { useSubcategories } from "@/hooks/useSubcategories";
 import { useGuardrails } from "@/hooks/useGuardrails";
 import { parseCSV, toNum, toInt } from "@/lib/csv";
+import { fsnWeightKey, loadFsnWeightUnitMap } from "@/lib/fsnWeightUnit";
 import {
   ChevronUp,
   ChevronDown,
@@ -31,8 +44,23 @@ import {
   Check,
   Maximize2,
   Minimize2,
+  Calculator,
+  ChevronLeft,
 } from "lucide-react";
-
+import { loadPricingSheetDemand, upsertDemandUploadRows } from "@/lib/pricingSheetCache";
+import { upsertFsnCostComponentsFromCsv, fetchFsnCostComponentsByFsns, parseFsnCostCsvRows } from "@/lib/skuCostComponents";
+import { RaasCheckTab } from "@/components/pricing/RaasCheckTab";
+import { RowAuditExpandButton } from "@/components/pricing/RowAuditHistoryButton";
+import {
+  auditRowKey,
+  buildExhaustiveLockDeltas,
+  fetchPricingSheetRow,
+  fetchRowAuditHistory,
+  formatAuditGrnMarkup,
+  formatSparseAuditCell,
+  recordLockAudit,
+  type PricingSheetAuditRow,
+} from "@/lib/pricingAudit";
 const TABLE_ZOOM_MIN = 50;
 const TABLE_ZOOM_MAX = 100;
 
@@ -89,10 +117,13 @@ function TableZoomControl({
 type SkuRow = {
   fsnId: string;
   skuId?: string;
+  rowId?: string;
   ncSkuId: string;
   ncSkuName: string;
   subcategory: string;
   weightUnit: string;
+  /** Original pricing_sheet.weight_unit used for Supabase row matching / audit keys. */
+  dbWeightUnit?: string;
   pointOfProcurement: string;
   conversionFactor: number;
   specialTag: string | null;
@@ -137,7 +168,7 @@ const SEED: SkuRow[] = [
 ];
 
 const CITIES = ["Bengaluru", "Chennai", "Coimbatore", "Hyderabad", "Mumbai", "Nashik", "Trichy"];
-const TABS = ["Price Upload", "Price Approval", "Demand Upload", "SKU Configuration", "Guardrails"];
+const TABS = ["Price Upload", "Price Approval", "Demand Upload", "SKU Configuration", "Guardrails", "RAAS Check"];
 
 const VIOLATIONS: { key: string; label: string }[] = [
   { key: "all", label: "All SKUs" },
@@ -156,6 +187,17 @@ function isDeflectionOutOfRange(pct: number, min = DEFLECTION_MIN, max = DEFLECT
   return pct < min || pct > max;
 }
 
+/** True when any editable price cell on the row is unlocked. */
+function hasUnlockedCell(row: SkuRow) {
+  return (
+    !(row.grnLocked ?? true) ||
+    !(row.blinkitLocked ?? true) ||
+    !(row.adjustedGrnLocked ?? true) ||
+    !row.quotedLocked ||
+    !row.negotiatedLocked
+  );
+}
+
 const fmt = (n: number | null | undefined, d = 2) =>
   n === null || n === undefined || Number.isNaN(n) ? "—" : `₹${n.toFixed(d)}`;
 const num = (n: number | null | undefined, d = 1) =>
@@ -172,10 +214,12 @@ function dbToSku(r: PricingSheetRow): SkuRow {
   return {
     fsnId: r.fsn_id ?? r.id ?? "",
     skuId: r.sku_id ?? undefined,
+    rowId: r.id,
     ncSkuId: r.sku_id ?? "",
     ncSkuName: r.sku_name ?? "",
     subcategory: r.subcategory ?? "",
     weightUnit: r.weight_unit ?? "",
+    dbWeightUnit: r.weight_unit_db ?? r.weight_unit ?? "",
     pointOfProcurement: r.bucket ?? "",
     conversionFactor: r.cf ?? 1,
     specialTag: r.bucket ?? null,
@@ -233,7 +277,38 @@ function deriveRow(r: SkuRow, totalDemand: number) {
       : null;
   const valueMix = r.blinkitSp !== null ? r.blinkitSp * r.demandUnits : null;
   const nlcValueMix = nlc * r.demandUnits;
-  return { grnPerUnit, prevDayGrnPerUnit: r.prevDayGrnPerUnit ?? null, grnDiff, nlc, piPct, gm, totalDemandPct, impactPpDiff, impactGm, valueMix, nlcValueMix };
+  const grnMarkup = grnPerUnit !== null ? r.quotedPp - grnPerUnit : null;
+  return { grnPerUnit, prevDayGrnPerUnit: r.prevDayGrnPerUnit ?? null, grnDiff, nlc, piPct, gm, totalDemandPct, impactPpDiff, impactGm, valueMix, nlcValueMix, grnMarkup };
+}
+
+/** Map a SkuRow into cascade fields for audit fallbacks (when no DB snapshot exists). */
+function skuToDbLike(r: SkuRow): Partial<PricingSheetRow> {
+  return {
+    grn_price_per_kg: r.grnPricePerKg,
+    grn_price_per_unit: null,
+    grn_diff: null,
+    blinkit_sp: r.blinkitSp,
+    adjusted_grn: r.adjustedGrn ?? 0,
+    quoted_pp: r.quotedPp,
+    negotiated_pp: r.negotiatedPp,
+    nlc: null,
+    nlc_negotiated: null,
+    pi_pct: null,
+    pi_pct_quoted: null,
+    pi_pct_negotiated: null,
+    gm: null,
+    deflection_pct: r.priceDeflectionPct,
+    impact_pp_diff: null,
+    impact_gm: null,
+    bk_value_mix: null,
+    cf: r.conversionFactor,
+    prev_grn_price_per_unit: r.prevDayGrnPerUnit ?? null,
+    pm_cost: r.packagingCost,
+    fml_dump: r.fmlCost,
+    pc: r.processingCost,
+    demand_units: r.demandUnits,
+    demand_pct: r.piMixPct,
+  };
 }
 
 type Enriched = { row: SkuRow; calc: ReturnType<typeof deriveRow> };
@@ -295,6 +370,7 @@ function computePriceUploadAverages(enriched: Enriched[]) {
     quotedPp: weightedByDemandPct(enriched, (e) => e.row.quotedPp),
     negotiatedPp: weightedByDemandPct(enriched, (e) => e.row.negotiatedPp),
     suggestedPp: weightedByDemandPct(enriched, (e) => e.row.suggestedPp),
+    grnMarkup: weightedByDemandPct(enriched, (e) => e.calc.grnMarkup),
   };
 }
 
@@ -348,31 +424,25 @@ export function PricingDashboard() {
   );
 
   // Live-load pricing_sheet rows when the user opens the sheet (Fetch/Create).
-  const { rows: dbRows, updateRow: dbUpdateRow, submitSheet: dbSubmit, refetch: dbRefetch } =
+  const { rows: dbRows, loading: sheetFetchLoading, priceSheetId, updateRow: dbUpdateRow, submitSheet: dbSubmit, refetch: dbRefetch } =
     usePricingSheet({ city, deliveryDate, autoFetch: false });
   const { subcategoryNames, resolveSubcategory } = useSubcategories();
+  const [sheetBusy, setSheetBusy] = useState(false);
+  const sheetLoading = sheetBusy || sheetFetchLoading;
 
   // Lightweight existence check for Create vs Fetch button (no full sheet load).
   const [sheetExists, setSheetExists] = useState<boolean | null>(null);
   const checkSheetExists = useCallback(async () => {
-    const { count, error } = await supabase
-      .from("pricing_sheet")
-      .select("id", { count: "exact", head: true })
-      .eq("city", city)
-      .eq("delivery_date", deliveryDate);
-    setSheetExists(!error && (count ?? 0) > 0);
+    const exists = await priceSheetHeaderExists(city, deliveryDate);
+    setSheetExists(exists);
   }, [city, deliveryDate]);
 
   useEffect(() => {
     let cancelled = false;
     setSheetExists(null);
     (async () => {
-      const { count, error } = await supabase
-        .from("pricing_sheet")
-        .select("id", { count: "exact", head: true })
-        .eq("city", city)
-        .eq("delivery_date", deliveryDate);
-      if (!cancelled) setSheetExists(!error && (count ?? 0) > 0);
+      const exists = await priceSheetHeaderExists(city, deliveryDate);
+      if (!cancelled) setSheetExists(exists);
     })();
     return () => { cancelled = true; };
   }, [city, deliveryDate]);
@@ -390,10 +460,12 @@ export function PricingDashboard() {
     // Merge DB rows into local rows so client-only fields (touched, acks) and
     // in-flight edits still awaiting a Supabase write don't get clobbered.
     setRows((prev) => {
-      const prevByKey = new Map(prev.map((p) => [`${p.fsnId}||${p.weightUnit}`, p]));
+      const prevByKey = new Map(
+        prev.map((p) => [`${p.fsnId}||${p.dbWeightUnit ?? p.weightUnit}`, p]),
+      );
       return dbRows.map((db) => {
         const fresh = dbToSku(db);
-        const key = `${fresh.fsnId}||${fresh.weightUnit}`;
+        const key = `${fresh.fsnId}||${fresh.dbWeightUnit ?? fresh.weightUnit}`;
         const p = prevByKey.get(key);
         if (!p) return fresh;
         const pendingKey = fresh.fsnId;
@@ -451,6 +523,42 @@ export function PricingDashboard() {
   const [appliedSubcategoryFilters, setAppliedSubcategoryFilters] = useState<Set<string>>(new Set());
   const [lockedSubcategoryFsnIds, setLockedSubcategoryFsnIds] = useState<Set<string> | null>(null);
   const [filterOpen, setFilterOpen] = useState(false);
+  const [expandedAuditKey, setExpandedAuditKey] = useState<string | null>(null);
+  const [auditHistoryByKey, setAuditHistoryByKey] = useState<Record<string, PricingSheetAuditRow[]>>({});
+  const [auditLoadingKey, setAuditLoadingKey] = useState<string | null>(null);
+
+  const toggleRowAudit = useCallback(
+    async (fsnId: string, weightUnit: string) => {
+      const row = rows.find((r) => r.fsnId === fsnId && r.weightUnit === weightUnit);
+      const matchWu = row?.dbWeightUnit ?? weightUnit;
+      const key = auditRowKey(fsnId, matchWu);
+      if (expandedAuditKey === key) {
+        setExpandedAuditKey(null);
+        return;
+      }
+      setExpandedAuditKey(key);
+      if (auditHistoryByKey[key]) return;
+      setAuditLoadingKey(key);
+      try {
+        const detailId = row?.rowId;
+        if (!detailId) {
+          setAuditHistoryByKey((prev) => ({ ...prev, [key]: [] }));
+          return;
+        }
+        const entries = await fetchRowAuditHistory({
+          priceSheetDetailsId: detailId,
+          limit: 3,
+        });
+        setAuditHistoryByKey((prev) => ({ ...prev, [key]: entries }));
+      } catch (e) {
+        console.warn("Failed to load audit history:", e);
+        setAuditHistoryByKey((prev) => ({ ...prev, [key]: [] }));
+      } finally {
+        setAuditLoadingKey(null);
+      }
+    },
+    [expandedAuditKey, auditHistoryByKey, city, deliveryDate, rows],
+  );
   const [subcatFilterOpen, setSubcatFilterOpen] = useState(false);
   const [sheetFullscreen, setSheetFullscreen] = useState(false);
   const [tableZoom, setTableZoom] = useState(TABLE_ZOOM_MAX);
@@ -468,6 +576,9 @@ export function PricingDashboard() {
     setPendingSubcategoryFilters(new Set());
     setAppliedSubcategoryFilters(new Set());
     setLockedSubcategoryFsnIds(null);
+    setExpandedAuditKey(null);
+    setAuditHistoryByKey({});
+    setAuditLoadingKey(null);
   }, [city, deliveryDate]);
 
   useEffect(() => {
@@ -578,6 +689,7 @@ export function PricingDashboard() {
         case "blinkitSp": return e.row.blinkitSp ?? -Infinity;
         case "adjustedGrn": return e.row.adjustedGrn ?? 0;
         case "quotedPp": return e.row.quotedPp;
+        case "grnMarkup": return e.calc.grnMarkup ?? -Infinity;
         case "negotiatedPp": return e.row.negotiatedPp;
         case "nlc": return e.calc.nlc;
         case "piPct": return e.calc.piPct ?? -Infinity;
@@ -616,16 +728,121 @@ export function PricingDashboard() {
     setRows((rs) => rs.map((r) => (r.fsnId === fsnId ? { ...r, ...patch } : r)));
   };
 
-  const persistRowFields = (fsnId: string, weightUnit: string, patch: Partial<SkuRow>) => {
+  /**
+   * Persist editable fields on lock. When `auditAfter` is provided, write a sparse
+   * pricing_sheet_audit row covering every column that changed — direct edits,
+   * UI cascades (quoted/negotiated/NLC/GM/…), and DB-trigger recomputes.
+   */
+  const persistRowFields = (
+    fsnId: string,
+    weightUnit: string,
+    patch: Partial<SkuRow>,
+    auditAfter?: SkuRow,
+  ) => {
     const dbPatch: Partial<PricingSheetRow> = {};
     for (const [k, col] of Object.entries(SAVE_MAP)) {
       if (k in patch) (dbPatch as Record<string, unknown>)[col] = (patch as Record<string, unknown>)[k];
     }
     if (Object.keys(dbPatch).length === 0) return;
+
+    // Snapshot before-state now (before the debounced write / optimistic DB merge).
+    // Match Supabase on original stored weight_unit (dbWeightUnit), not MySQL display value.
+    const uiRow = rows.find((r) => r.fsnId === fsnId && r.weightUnit === weightUnit);
+    const matchWu = uiRow?.dbWeightUnit ?? weightUnit;
+    const beforeDb = dbRows.find(
+      (r) =>
+        r.fsn_id === fsnId &&
+        ((r.weight_unit_db ?? r.weight_unit ?? null) === (matchWu ?? null) ||
+          (r.weight_unit ?? null) === (matchWu ?? null)),
+    );
+    const beforeDbSnapshot: PricingSheetRow | null = beforeDb
+      ? {
+          ...beforeDb,
+          // Ensure cascade inputs are present even if a prior optimistic patch omitted them.
+          cf: beforeDb.cf ?? uiRow?.conversionFactor ?? 1,
+          pm_cost: beforeDb.pm_cost ?? uiRow?.packagingCost ?? 0,
+          fml_dump: beforeDb.fml_dump ?? uiRow?.fmlCost ?? 0,
+          pc: beforeDb.pc ?? uiRow?.processingCost ?? 0,
+          prev_grn_price_per_unit:
+            beforeDb.prev_grn_price_per_unit ?? uiRow?.prevDayGrnPerUnit ?? null,
+          demand_units: beforeDb.demand_units ?? uiRow?.demandUnits ?? 0,
+          demand_pct: beforeDb.demand_pct ?? uiRow?.piMixPct ?? 0,
+        }
+      : null;
+
     const key = fsnId;
     if (saveTimers.current[key]) clearTimeout(saveTimers.current[key]);
     saveTimers.current[key] = setTimeout(() => {
-      dbUpdateRow({ fsn_id: fsnId, weight_unit: weightUnit }, dbPatch)
+      const match: { id?: string; fsn_id: string; weight_unit: string | null } = {
+        fsn_id: fsnId,
+        weight_unit: matchWu ?? null,
+      };
+      if (beforeDb?.id) match.id = beforeDb.id;
+      dbUpdateRow(match, dbPatch)
+        .then(async (updatedFromWrite) => {
+          if (!auditAfter) return;
+          try {
+            // Prefer the row returned by UPDATE…RETURNING; fall back to an explicit fetch
+            // so trigger-computed columns are included in the audit delta.
+            const afterDb =
+              updatedFromWrite ??
+              (await fetchPricingSheetRow({
+                city,
+                deliveryDate,
+                fsnId,
+                weightUnit: matchWu,
+              }));
+
+            // Exhaustive before/after: history gets PREVIOUS values (8 when 8→10),
+            // current snapshot gets AFTER values. Keep last 3 previous only.
+            const { previous, current } = buildExhaustiveLockDeltas({
+              beforeDb: beforeDbSnapshot ?? (uiRow ? skuToDbLike(uiRow) : null),
+              afterDb: afterDb ?? (auditAfter ? skuToDbLike(auditAfter) : null),
+              lockPatch: dbPatch,
+            });
+            if (Object.keys(previous).length === 0 && Object.keys(current).length === 0) return;
+
+            const detailId =
+              afterDb?.id ??
+              beforeDbSnapshot?.id ??
+              auditAfter.rowId ??
+              null;
+            if (!detailId || !priceSheetId) return;
+
+            await recordLockAudit({
+              priceSheetDetailsId: detailId,
+              priceSheetId,
+              city,
+              deliveryDate,
+              fsnId,
+              weightUnit: matchWu,
+              cityId: afterDb?.city_id ?? beforeDbSnapshot?.city_id ?? null,
+              skuId:
+                afterDb?.sku_id ??
+                beforeDbSnapshot?.sku_id ??
+                auditAfter.skuId ??
+                auditAfter.ncSkuId ??
+                null,
+              previousDelta: previous,
+              currentDelta: current,
+            });
+
+            // Always refresh history cache after a lock so prev1/2/3 stay correct.
+            const aKey = auditRowKey(fsnId, matchWu);
+            setAuditHistoryByKey((prev) => {
+              const next = { ...prev };
+              delete next[aKey];
+              return next;
+            });
+            if (expandedAuditKey === aKey) {
+              fetchRowAuditHistory({ priceSheetDetailsId: detailId, limit: 3 })
+                .then((entries) => setAuditHistoryByKey((p) => ({ ...p, [aKey]: entries })))
+                .catch(() => {});
+            }
+          } catch (e) {
+            console.warn("Audit log write failed:", e);
+          }
+        })
         .catch(async (e) => {
           const { toast } = await import("sonner");
           toast.error(`Save failed: ${(e as Error).message}`);
@@ -646,7 +863,11 @@ export function PricingDashboard() {
     const jobs: Job[] = [];
     for (const u of updates) {
       const row = rows.find(
-        (r) => r.fsnId === u.fsnId && (u.weightUnit ? r.weightUnit === u.weightUnit : true),
+        (r) =>
+          r.fsnId === u.fsnId &&
+          (u.weightUnit
+            ? r.weightUnit === u.weightUnit || r.dbWeightUnit === u.weightUnit
+            : true),
       );
       if (!row) continue;
       const patch: Partial<SkuRow> = {};
@@ -690,7 +911,11 @@ export function PricingDashboard() {
     for (const j of jobs) {
       try {
         await dbUpdateRow(
-          { fsn_id: j.row.fsnId, weight_unit: j.row.weightUnit ?? null },
+          {
+            id: j.row.rowId,
+            fsn_id: j.row.fsnId,
+            weight_unit: j.row.dbWeightUnit ?? j.row.weightUnit ?? null,
+          },
           j.dbPatch,
         );
       } catch (e) {
@@ -728,35 +953,55 @@ export function PricingDashboard() {
     }
   };
 
-  const anyUnlockedEdit = rows.some(
-    (r) =>
-      !(r.grnLocked ?? true) ||
-      !(r.blinkitLocked ?? true) ||
-      !(r.adjustedGrnLocked ?? true) ||
-      !r.quotedLocked ||
-      !r.negotiatedLocked
-  );
+  const anyUnlockedEdit = rows.some(hasUnlockedCell);
   const blockedBySuggestion = rows.some(
     (r) => r.suggestedPp !== null && (!r.negotiatedLocked || r.negotiatedPp === r.lastLockedNegotiated && r.suggestionAcknowledgedAt === 0)
   );
   const submitDisabled = anyUnlockedEdit || submitted;
 
   const onCreateOrFetch = async () => {
-    await dbRefetch();
-    await checkSheetExists();
-    setSheetCreated(true);
-    if (status === "draft") setStatus("created");
+    setSheetBusy(true);
+    const { toast } = await import("sonner");
+    try {
+      toast.loading("Loading pricing sheet…", { id: "demand-fetch" });
+      const result = await loadPricingSheetDemand(deliveryDate, city);
+
+      if (result.source === "cache") {
+        await dbRefetch();
+        await checkSheetExists();
+        setSheetCreated(true);
+        toast.success("Pricing sheet loaded (cached)", { id: "demand-fetch" });
+        return;
+      }
+
+      if (result.rowCount === 0) {
+        toast.error("No demand data found for this date and city", { id: "demand-fetch" });
+        await dbRefetch();
+        await checkSheetExists();
+        setSheetCreated(true);
+        return;
+      }
+
+      await dbRefetch();
+      await checkSheetExists();
+      setSheetCreated(true);
+      if (status === "draft") setStatus("created");
+      toast.success(`Pricing sheet ready — ${result.rowCount} rows from demand`, { id: "demand-fetch" });
+    } catch (e) {
+      toast.error(`Failed to build sheet from demand: ${(e as Error).message}`, { id: "demand-fetch" });
+    } finally {
+      setSheetBusy(false);
+    }
   };
 
   const onDownloadFkSheet = () => {
-    // FK Sheet: header "Quoted PP" but values come from negotiatedPp per spec.
     const esc = (v: unknown) => {
       const s = v === null || v === undefined ? "" : String(v);
       return /[",\n\r]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
     };
-    const header = "FSN ID,Weight Unit,Quoted PP\n";
+    const header = "FSN,Quoted PP\n";
     const body = rows
-      .map((r) => `${esc(r.fsnId)},${esc(r.weightUnit)},${r.negotiatedPp ?? ""}`)
+      .map((r) => `${esc(r.fsnId)},${r.quotedPp ?? ""}`)
       .join("\n");
     const blob = new Blob([header + body], { type: "text/csv" });
     const url = URL.createObjectURL(blob);
@@ -862,7 +1107,7 @@ export function PricingDashboard() {
             <span>/</span>
             <span className="text-foreground">Ecom Pricing</span>
             <span>/</span>
-            <span>Price Upload</span>
+            <span>{TABS[tab] ?? "Price Upload"}</span>
           </div>
           <div className="flex items-center gap-3">
             {tab === 0 && sheetCreated && (
@@ -936,12 +1181,12 @@ export function PricingDashboard() {
               </select>
             </div>
             <button
-              onClick={onCreateOrFetch}
-              disabled={sheetExists === null}
+              onClick={() => { void onCreateOrFetch(); }}
+              disabled={sheetExists === null || sheetLoading}
               className="inline-flex h-8 items-center gap-1.5 rounded-md bg-primary px-3 text-[12px] font-medium text-primary-foreground hover:opacity-90 disabled:cursor-not-allowed disabled:opacity-50"
             >
-              {sheetExists === null ? (
-                <><RefreshCw className="h-3.5 w-3.5 animate-spin" /> …</>
+              {sheetExists === null || sheetLoading ? (
+                <><RefreshCw className="h-3.5 w-3.5 animate-spin" /> {sheetLoading ? (showCreate ? "Creating…" : "Fetching…") : "…"}</>
               ) : showCreate ? (
                 <><Plus className="h-3.5 w-3.5" /> Create</>
               ) : (
@@ -950,25 +1195,90 @@ export function PricingDashboard() {
             </button>
           </div>
 
-          {sheetCreated && (<>
+          {sheetLoading && (
+            <div className="mb-3 flex items-center gap-3 rounded-md border border-primary/20 bg-card px-4 py-5 shadow-sm">
+              <RefreshCw className="h-5 w-5 shrink-0 animate-spin text-primary" />
+              <div>
+                <p className="text-[13px] font-medium text-foreground">
+                  {showCreate ? "Creating" : "Fetching"} pricing sheet from demand…
+                </p>
+                <p className="mt-0.5 text-[12px] text-muted-foreground">
+                  {city} · {deliveryDate}. Loading rows and weight units — this can take a moment.
+                </p>
+              </div>
+            </div>
+          )}
+
+          {sheetCreated && !sheetLoading && (<>
           {/* Action bar */}
           <div className="mb-3 flex flex-wrap items-end justify-between gap-2 rounded-md border bg-card p-2">
             <div className="flex flex-wrap items-end gap-2">
               <button
                 onClick={() => {
-                  const header = "FSN ID,Weight Unit,NC SKU ID,NC SKU Name,Subcategory,Conv. Factor,Demand Units,Total Demand %,GRN ₹/kg,GRN ₹/unit,Prev Day GRN ₹/unit,GRN Diff,Blinkit SP,Adjusted GRN,Quoted PP,Negotiated PP,NLC,PI %,GM,Deflection %,Impact PP Diff,Impact GM,BK Value Mix\n";
+                  // Column order matches the Price Upload table (left → right).
+                  const header = [
+                    "FSN ID",
+                    "Weight Unit",
+                    "Total Demand %",
+                    "NC SKU Name",
+                    "Special Tags",
+                    "Subcategory",
+                    "Conv. Factor",
+                    "Demand Units",
+                    "NLC Value Mix",
+                    "GRN ₹/kg",
+                    "Prev Day GRN ₹/unit",
+                    "GRN ₹/unit",
+                    "GRN Diff",
+                    "Adjusted GRN",
+                    "Blinkit SP",
+                    "WSP Trend",
+                    "Quoted PP",
+                    "GRN Markup",
+                    "Negotiated PP",
+                    "Suggested PP",
+                    "NLC",
+                    "PI %",
+                    "GM",
+                    "Deflection %",
+                    "Impact PP Diff",
+                    "Impact GM",
+                    "BK Value Mix",
+                  ].join(",") + "\n";
                   const esc = (v: unknown) => {
                     const s = v === null || v === undefined ? "" : String(v);
                     return /[",\n\r]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
                   };
                   const body = sorted.map(({ row, calc }) =>
-                    [row.fsnId, row.weightUnit, row.ncSkuId, row.ncSkuName, row.subcategory, row.conversionFactor,
-                     row.demandUnits, calc.totalDemandPct?.toFixed(3), row.grnPricePerKg ?? "",
-                     calc.grnPerUnit?.toFixed(2) ?? "", row.prevDayGrnPerUnit ?? "", calc.grnDiff?.toFixed(2) ?? "",
-                     row.blinkitSp ?? "", row.adjustedGrn ?? 0, row.quotedPp, row.negotiatedPp,
-                     calc.nlc.toFixed(2), calc.piPct?.toFixed(2) ?? "", calc.gm?.toFixed(2) ?? "",
-                     row.priceDeflectionPct, calc.impactPpDiff?.toFixed(2) ?? "",
-                     calc.impactGm?.toFixed(2) ?? "", calc.valueMix?.toFixed(0) ?? ""].map(esc).join(",")
+                    [
+                      row.fsnId,
+                      row.weightUnit,
+                      calc.totalDemandPct?.toFixed(3) ?? "",
+                      row.ncSkuName,
+                      row.specialTag ?? "",
+                      row.subcategory,
+                      row.conversionFactor,
+                      row.demandUnits,
+                      calc.nlcValueMix != null ? Math.round(calc.nlcValueMix) : "",
+                      row.grnPricePerKg ?? "",
+                      row.prevDayGrnPerUnit ?? "",
+                      calc.grnPerUnit?.toFixed(2) ?? "",
+                      calc.grnDiff?.toFixed(2) ?? "",
+                      row.adjustedGrn ?? 0,
+                      row.blinkitSp ?? "",
+                      row.wspTrend ?? "",
+                      row.quotedPp,
+                      calc.grnMarkup?.toFixed(2) ?? "",
+                      row.negotiatedPp,
+                      row.suggestedPp ?? "",
+                      calc.nlc.toFixed(2),
+                      calc.piPct?.toFixed(2) ?? "",
+                      calc.gm?.toFixed(2) ?? "",
+                      row.priceDeflectionPct,
+                      calc.impactPpDiff?.toFixed(2) ?? "",
+                      calc.impactGm?.toFixed(2) ?? "",
+                      calc.valueMix?.toFixed(0) ?? "",
+                    ].map(esc).join(",")
                   ).join("\n");
                   const blob = new Blob([header + body], { type: "text/csv" });
                   const url = URL.createObjectURL(blob);
@@ -1204,6 +1514,10 @@ export function PricingDashboard() {
                   sortDir={sortDir}
                   toggleSort={toggleSort}
                   averages={averages}
+                  expandedAuditKey={expandedAuditKey}
+                  auditHistoryByKey={auditHistoryByKey}
+                  auditLoadingKey={auditLoadingKey}
+                  onToggleAudit={toggleRowAudit}
                 />
                 <FrozenPaneResizeHandle
                   scale={tableZoom / 100}
@@ -1223,6 +1537,9 @@ export function PricingDashboard() {
                   updateRowLocal={updateRowLocal}
                   persistRowFields={persistRowFields}
                   submitted={submitted}
+                  expandedAuditKey={expandedAuditKey}
+                  auditHistoryByKey={auditHistoryByKey}
+                  auditLoadingKey={auditLoadingKey}
                 />
               </div>
             </div>
@@ -1252,6 +1569,9 @@ export function PricingDashboard() {
           {tab === 2 && <UploadPanel kind="demand" />}
           {tab === 3 && <SkuConfigTab />}
           {tab === 4 && <GuardRailsTab />}
+          <div className={tab === 5 ? "block" : "hidden"} aria-hidden={tab !== 5}>
+            <RaasCheckTab parentDate={deliveryDate} parentCity={city} />
+          </div>
         </main>
       </div>
 
@@ -1417,9 +1737,16 @@ function BulkUploadModal({
         <button
           onClick={submit}
           disabled={!file || busy}
-          className="h-8 rounded-md bg-primary px-3 text-[12px] font-medium text-primary-foreground hover:opacity-90 disabled:opacity-50"
+          className="inline-flex h-8 items-center gap-1.5 rounded-md bg-primary px-3 text-[12px] font-medium text-primary-foreground hover:opacity-90 disabled:opacity-50"
         >
-          {busy ? "Applying…" : "Apply"}
+          {busy ? (
+            <>
+              <span className="h-3.5 w-3.5 animate-spin rounded-full border-2 border-primary-foreground border-t-transparent" />
+              Applying…
+            </>
+          ) : (
+            "Apply"
+          )}
         </button>
       </div>
     </Modal>
@@ -1642,9 +1969,14 @@ function GroupBar({ children, className = "" }: { children: React.ReactNode; cla
 
 function FrozenTable({
   rows, sortKey, sortDir, toggleSort, averages,
+  expandedAuditKey, auditHistoryByKey, auditLoadingKey, onToggleAudit,
 }: {
   rows: Enriched[]; sortKey: string | null; sortDir: SortDir; toggleSort: (k: string) => void;
   averages: ReturnType<typeof computePriceUploadAverages>;
+  expandedAuditKey: string | null;
+  auditHistoryByKey: Record<string, PricingSheetAuditRow[]>;
+  auditLoadingKey: string | null;
+  onToggleAudit: (fsnId: string, weightUnit: string) => void;
 }) {
   return (
     <table className="w-full table-fixed border-collapse text-[12px] [&_th]:box-border [&_td]:box-border [&_th]:overflow-hidden [&_td]:overflow-hidden [&_th]:border-r [&_td]:border-r [&_th]:border-border/60 [&_td]:border-border/60 [&_tr>*:last-child]:border-r-0">
@@ -1671,17 +2003,66 @@ function FrozenTable({
           const negPi = calc.piPct !== null && calc.piPct < 0;
           const negGm = calc.gm !== null && calc.gm < 0;
           const highDefl = isDeflectionOutOfRange(row.priceDeflectionPct);
-          const rowCls = negPi || negGm
-            ? "border-l-4 border-l-red-500 bg-red-50/50"
-            : highDefl
-            ? "border-l-4 border-l-amber-500 bg-amber-50/50"
-            : "";
+          const unlocked = hasUnlockedCell(row);
+          const rowCls = [
+            unlocked ? "bg-yellow-50 hover:bg-yellow-100/80" : "hover:bg-muted/40",
+            negPi || negGm
+              ? "border-l-4 border-l-red-500"
+              : highDefl
+              ? "border-l-4 border-l-amber-500"
+              : "",
+          ].filter(Boolean).join(" ");
+          const key = auditRowKey(row.fsnId, row.dbWeightUnit ?? row.weightUnit);
+          const expanded = expandedAuditKey === key;
+          const history = auditHistoryByKey[key] ?? [];
+          const loading = auditLoadingKey === key;
           return (
-            <tr key={row.fsnId} className={`${ROW_H} border-b last:border-b-0 hover:bg-muted/40 ${rowCls}`}>
-              <td title={row.fsnId} className="truncate px-2 font-mono text-[11px] text-muted-foreground">{row.fsnId}</td>
-              <td title={row.weightUnit} className="truncate px-2 text-muted-foreground">{row.weightUnit}</td>
-              <td className="truncate border-l px-2 text-right tabular-nums">{calc.totalDemandPct.toFixed(3)}%</td>
-            </tr>
+            <Fragment key={row.fsnId}>
+              <tr className={`${ROW_H} border-b last:border-b-0 ${rowCls}`}>
+                <td title={row.fsnId} className="truncate px-2 font-mono text-[11px] text-muted-foreground">
+                  <div className="flex min-w-0 items-center gap-0.5">
+                    <RowAuditExpandButton
+                      fsnId={row.fsnId}
+                      expanded={expanded}
+                      onToggle={() => onToggleAudit(row.fsnId, row.weightUnit)}
+                    />
+                    <span className="min-w-0 truncate">{row.fsnId}</span>
+                  </div>
+                </td>
+                <td title={row.weightUnit} className="truncate px-2 text-muted-foreground">{row.weightUnit}</td>
+                <td className="truncate border-l px-2 text-right tabular-nums">{calc.totalDemandPct.toFixed(3)}%</td>
+              </tr>
+              {expanded && loading && (
+                <tr className={`${ROW_H} border-b bg-muted/30`}>
+                  <td colSpan={3} className="px-2 text-[11px] text-muted-foreground">Loading history…</td>
+                </tr>
+              )}
+              {expanded && !loading && history.length === 0 && (
+                <tr className={`${ROW_H} border-b bg-muted/30`}>
+                  <td colSpan={3} className="px-2 text-[11px] text-muted-foreground">No previous changes</td>
+                </tr>
+              )}
+              {expanded && !loading && history.map((entry, idx) => (
+                <tr key={entry.revision_id} className={`${ROW_H} border-b bg-muted/25 text-muted-foreground`}>
+                  <td className="truncate px-2 pl-7 font-mono text-[10px]">
+                    prev {idx + 1}
+                  </td>
+                  <td className="truncate px-2 text-[10px]">
+                    {entry.created_at
+                      ? new Date(entry.created_at).toLocaleString(undefined, {
+                          month: "short",
+                          day: "numeric",
+                          hour: "2-digit",
+                          minute: "2-digit",
+                        })
+                      : ""}
+                  </td>
+                  <td className="truncate border-l px-2 text-right tabular-nums text-[11px]">
+                    {formatSparseAuditCell(entry, "demand_pct")}
+                  </td>
+                </tr>
+              ))}
+            </Fragment>
           );
         })}
       </tbody>
@@ -1692,6 +2073,7 @@ function FrozenTable({
 // ---------- Scrollable right table ----------
 function ScrollTable({
   rows, sortKey, sortDir, toggleSort, averages, updateRowLocal, persistRowFields, submitted,
+  expandedAuditKey, auditHistoryByKey, auditLoadingKey,
 }: {
   rows: Enriched[];
   sortKey: string | null;
@@ -1699,18 +2081,21 @@ function ScrollTable({
   toggleSort: (k: string) => void;
   averages: any;
   updateRowLocal: (id: string, p: Partial<SkuRow>) => void;
-  persistRowFields: (id: string, weightUnit: string, p: Partial<SkuRow>) => void;
+  persistRowFields: (id: string, weightUnit: string, p: Partial<SkuRow>, auditAfter?: SkuRow) => void;
   submitted: boolean;
+  expandedAuditKey: string | null;
+  auditHistoryByKey: Record<string, PricingSheetAuditRow[]>;
+  auditLoadingKey: string | null;
 }) {
   return (
-    <table className="min-w-[1850px] border-collapse text-[12px] [&_th]:box-border [&_td]:box-border [&_th]:overflow-hidden [&_td]:overflow-hidden [&_th]:border-r [&_td]:border-r [&_th]:border-border/60 [&_td]:border-border/60 [&_tr>*:last-child]:border-r-0">
+    <table className="min-w-[1960px] border-collapse text-[12px] [&_th]:box-border [&_td]:box-border [&_th]:overflow-hidden [&_td]:overflow-hidden [&_th]:border-r [&_td]:border-r [&_th]:border-border/60 [&_td]:border-border/60 [&_tr>*:last-child]:border-r-0">
       <colgroup>
         {/* Basic Info (scrollable): NC SKU Name, Special Tags, Subcategory, Conv. Factor, Demand Units */}
         <col style={{ width: 200 }} /><col style={{ width: 110 }} /><col style={{ width: 120 }} /><col style={{ width: 100 }} /><col style={{ width: 110 }} />
         {/* Demand Info (6): NLC Value Mix, GRN/kg, Prev GRN/unit, GRN/unit, GRN Diff, Adjusted GRN */}
         <col style={{ width: 120 }} /><col style={{ width: 100 }} /><col style={{ width: 130 }} /><col style={{ width: 110 }} /><col style={{ width: 100 }} /><col style={{ width: 120 }} />
-        {/* Benchmark Info (12) */}
-        <col style={{ width: 90 }} /><col style={{ width: 80 }} /><col style={{ width: 120 }} /><col style={{ width: 120 }} /><col style={{ width: 100 }} /><col style={{ width: 80 }} /><col style={{ width: 80 }} /><col style={{ width: 80 }} /><col style={{ width: 100 }} /><col style={{ width: 110 }} /><col style={{ width: 100 }} /><col style={{ width: 110 }} />
+        {/* Benchmark Info (13) */}
+        <col style={{ width: 90 }} /><col style={{ width: 80 }} /><col style={{ width: 120 }} /><col style={{ width: 110 }} /><col style={{ width: 120 }} /><col style={{ width: 100 }} /><col style={{ width: 80 }} /><col style={{ width: 80 }} /><col style={{ width: 80 }} /><col style={{ width: 100 }} /><col style={{ width: 110 }} /><col style={{ width: 100 }} /><col style={{ width: 110 }} />
       </colgroup>
       <thead>
         <tr className={GROUP_HEAD_H}>
@@ -1718,7 +2103,7 @@ function ScrollTable({
           <th colSpan={3} className={`${STICKY_GROUP} ${GROUP_TH} truncate border-b border-l bg-muted px-2 text-left text-[10px] font-semibold uppercase tracking-wider text-muted-foreground`}>Basic Information (cont.)</th>
           <th colSpan={1} className={`${STICKY_GROUP} ${GROUP_TH} truncate border-b border-l bg-muted px-2 text-left text-[10px] font-semibold uppercase tracking-wider text-muted-foreground`}>Demand Information</th>
           <th colSpan={6} className={`${STICKY_GROUP} ${GROUP_TH} truncate border-b border-l bg-muted px-2 text-left text-[10px] font-semibold uppercase tracking-wider text-muted-foreground`}>Demand Information</th>
-          <th colSpan={12} className={`${STICKY_GROUP} ${GROUP_TH} truncate border-b border-l bg-muted px-2 text-left text-[10px] font-semibold uppercase tracking-wider text-muted-foreground`}>Benchmark Information</th>
+          <th colSpan={13} className={`${STICKY_GROUP} ${GROUP_TH} truncate border-b border-l bg-muted px-2 text-left text-[10px] font-semibold uppercase tracking-wider text-muted-foreground`}>Benchmark Information</th>
         </tr>
 
         <tr className={`${COL_HEAD_H} border-b`}>
@@ -1739,6 +2124,7 @@ function ScrollTable({
           <th className={`${STICKY_COL} ${HEAD_TH} border-l bg-card px-2`}><SortHeader align="right" label="Blinkit SP" active={sortKey==="blinkitSp"} dir={sortDir} onClick={() => toggleSort("blinkitSp")} /></th>
           <th title="WSP Trend" className={`${STICKY_COL} ${HEAD_TH} truncate bg-card px-2 text-center text-[11px] font-semibold uppercase tracking-wide text-muted-foreground`}>WSP Trend</th>
           <th className={`${STICKY_COL} ${HEAD_TH} bg-card px-2`}><SortHeader align="right" label="Quoted PP" active={sortKey==="quotedPp"} dir={sortDir} onClick={() => toggleSort("quotedPp")} /></th>
+          <th className={`${STICKY_COL} ${HEAD_TH} bg-card px-2`}><Tip text="Quoted PP − GRN ₹/unit"><SortHeader align="right" label="GRN Markup" active={sortKey==="grnMarkup"} dir={sortDir} onClick={() => toggleSort("grnMarkup")} /></Tip></th>
           <th className={`${STICKY_COL} ${HEAD_TH} bg-card px-2`}><SortHeader align="right" label="Negotiated PP" active={sortKey==="negotiatedPp"} dir={sortDir} onClick={() => toggleSort("negotiatedPp")} /></th>
           <th title="Suggested PP" className={`${STICKY_COL} ${HEAD_TH} truncate bg-card px-2 text-right text-[11px] font-semibold uppercase tracking-wide text-muted-foreground`}>Suggested PP</th>
           <th className={`${STICKY_COL} ${HEAD_TH} bg-card px-2`}><SortHeader align="right" label="NLC" active={sortKey==="nlc"} dir={sortDir} onClick={() => toggleSort("nlc")} /></th>
@@ -1764,6 +2150,7 @@ function ScrollTable({
           <td className={`${STICKY_AVG} ${AVG_TD} border-l bg-accent px-2 text-right tabular-nums`}>{fmt(averages.blinkitSp)}</td>
           <td className={`${STICKY_AVG} ${AVG_TD} bg-accent px-2 text-center text-muted-foreground`}>—</td>
           <td className={`${STICKY_AVG} ${AVG_TD} bg-accent px-2 text-right tabular-nums`}>{fmt(averages.quotedPp)}</td>
+          <td className={`${STICKY_AVG} ${AVG_TD} bg-accent px-2 text-right tabular-nums`}>{fmt(averages.grnMarkup)}</td>
           <td className={`${STICKY_AVG} ${AVG_TD} bg-accent px-2 text-right tabular-nums`}>{fmt(averages.negotiatedPp)}</td>
           <td className={`${STICKY_AVG} ${AVG_TD} bg-accent px-2 text-right tabular-nums`}>{fmt(averages.suggestedPp)}</td>
           <td className={`${STICKY_AVG} ${AVG_TD} bg-accent px-2 text-right tabular-nums`}>{fmt(averages.nlc)}</td>
@@ -1782,8 +2169,14 @@ function ScrollTable({
           const suggestionPending =
             row.suggestedPp !== null &&
             (!row.negotiatedLocked || row.negotiatedPp === row.lastLockedNegotiated);
+          const unlocked = hasUnlockedCell(row);
+          const key = auditRowKey(row.fsnId, row.dbWeightUnit ?? row.weightUnit);
+          const expanded = expandedAuditKey === key;
+          const history = auditHistoryByKey[key] ?? [];
+          const loading = auditLoadingKey === key;
           return (
-            <tr key={row.fsnId} className={`${ROW_H} border-b last:border-b-0 hover:bg-muted/40`}>
+            <Fragment key={row.fsnId}>
+            <tr className={`${ROW_H} border-b last:border-b-0 ${unlocked ? "bg-yellow-50 hover:bg-yellow-100/80" : "hover:bg-muted/40"}`}>
               {/* Basic Info (scrollable) */}
               <td className="max-w-[200px] truncate px-2 text-[11px]">{row.ncSkuName || "—"}</td>
               <td className="border-l px-2">
@@ -1814,7 +2207,12 @@ function ScrollTable({
                       updateRowLocal(row.fsnId, { grnLocked: false });
                     } else {
                       updateRowLocal(row.fsnId, { grnLocked: true });
-                      persistRowFields(row.fsnId, row.weightUnit, { grnPricePerKg: row.grnPricePerKg });
+                      persistRowFields(
+                        row.fsnId,
+                        row.weightUnit,
+                        { grnPricePerKg: row.grnPricePerKg },
+                        { ...row, grnLocked: true },
+                      );
                     }
                   }}
                 />
@@ -1858,7 +2256,7 @@ function ScrollTable({
                         }
                       }
                       updateRowLocal(row.fsnId, patch);
-                      persistRowFields(row.fsnId, row.weightUnit, persist);
+                      persistRowFields(row.fsnId, row.weightUnit, persist, { ...row, ...patch });
                     }
                   }}
                 />
@@ -1879,7 +2277,12 @@ function ScrollTable({
                       updateRowLocal(row.fsnId, { blinkitLocked: false });
                     } else {
                       updateRowLocal(row.fsnId, { blinkitLocked: true });
-                      persistRowFields(row.fsnId, row.weightUnit, { blinkitSp: row.blinkitSp });
+                      persistRowFields(
+                        row.fsnId,
+                        row.weightUnit,
+                        { blinkitSp: row.blinkitSp },
+                        { ...row, blinkitLocked: true },
+                      );
                     }
                   }}
                 />
@@ -1896,31 +2299,58 @@ function ScrollTable({
               </td>
               {/* Quoted PP */}
               <td className="px-2">
-                <LockedPriceInput
-                  value={row.quotedPp}
-                  locked={row.quotedLocked}
-                  disabled={submitted}
-                  onChange={(v) => {
-                    const next: Partial<SkuRow> = { quotedPp: v, quotedTouched: true };
-                    setPartialIfNegotiatedFollows(next, row, v);
-                    updateRowLocal(row.fsnId, next);
-                  }}
-                  onUnlock={() => updateRowLocal(row.fsnId, { quotedLocked: false })}
-                  onToggleLock={() => {
-                    if (!row.quotedLocked) {
-                      updateRowLocal(row.fsnId, {
-                        quotedLocked: true,
-                        negotiatedPp: row.quotedPp,
-                      });
-                      persistRowFields(row.fsnId, row.weightUnit, {
-                        quotedPp: row.quotedPp,
-                        negotiatedPp: row.quotedPp,
-                      });
-                    } else {
-                      updateRowLocal(row.fsnId, { quotedLocked: false });
-                    }
-                  }}
-                />
+                <div className="flex items-center justify-end gap-1">
+                  <QuotedPpFormulaButton
+                    row={row}
+                    disabled={submitted}
+                    locked={row.quotedLocked}
+                    onUnlock={() => updateRowLocal(row.fsnId, { quotedLocked: false })}
+                    onApply={(v) => {
+                      const next: Partial<SkuRow> = { quotedPp: v, quotedTouched: true };
+                      setPartialIfNegotiatedFollows(next, row, v);
+                      updateRowLocal(row.fsnId, next);
+                    }}
+                  />
+                  <LockedPriceInput
+                    value={row.quotedPp}
+                    locked={row.quotedLocked}
+                    disabled={submitted}
+                    onChange={(v) => {
+                      const next: Partial<SkuRow> = { quotedPp: v, quotedTouched: true };
+                      setPartialIfNegotiatedFollows(next, row, v);
+                      updateRowLocal(row.fsnId, next);
+                    }}
+                    onUnlock={() => updateRowLocal(row.fsnId, { quotedLocked: false })}
+                    onToggleLock={() => {
+                      if (!row.quotedLocked) {
+                        const after: SkuRow = {
+                          ...row,
+                          quotedLocked: true,
+                          negotiatedPp: row.quotedPp,
+                        };
+                        updateRowLocal(row.fsnId, {
+                          quotedLocked: true,
+                          negotiatedPp: row.quotedPp,
+                        });
+                        persistRowFields(
+                          row.fsnId,
+                          row.weightUnit,
+                          {
+                            quotedPp: row.quotedPp,
+                            negotiatedPp: row.quotedPp,
+                          },
+                          after,
+                        );
+                      } else {
+                        updateRowLocal(row.fsnId, { quotedLocked: false });
+                      }
+                    }}
+                  />
+                </div>
+              </td>
+              {/* GRN Markup = Quoted PP − GRN ₹/unit */}
+              <td className="px-2 text-right tabular-nums">
+                {calc.grnMarkup !== null ? fmt(calc.grnMarkup) : "—"}
               </td>
               {/* Negotiated PP */}
               <td className="px-2">
@@ -1933,11 +2363,21 @@ function ScrollTable({
                   onUnlock={() => updateRowLocal(row.fsnId, { negotiatedLocked: false })}
                   onToggleLock={() => {
                     if (!row.negotiatedLocked) {
+                      const after: SkuRow = {
+                        ...row,
+                        negotiatedLocked: true,
+                        lastLockedNegotiated: row.negotiatedPp,
+                      };
                       updateRowLocal(row.fsnId, {
                         negotiatedLocked: true,
                         lastLockedNegotiated: row.negotiatedPp,
                       });
-                      persistRowFields(row.fsnId, row.weightUnit, { negotiatedPp: row.negotiatedPp });
+                      persistRowFields(
+                        row.fsnId,
+                        row.weightUnit,
+                        { negotiatedPp: row.negotiatedPp },
+                        after,
+                      );
                     } else {
                       updateRowLocal(row.fsnId, { negotiatedLocked: false });
                     }
@@ -1973,6 +2413,51 @@ function ScrollTable({
               {/* BK Value Mix */}
               <td className="px-2 text-right tabular-nums">{calc.valueMix !== null ? `₹${Math.round(calc.valueMix).toLocaleString()}` : "—"}</td>
             </tr>
+            {expanded && loading && (
+              <tr className={`${ROW_H} border-b bg-muted/30`}>
+                <td colSpan={24} className="px-2 text-[11px] text-muted-foreground">Loading history…</td>
+              </tr>
+            )}
+            {expanded && !loading && history.length === 0 && (
+              <tr className={`${ROW_H} border-b bg-muted/30`}>
+                <td colSpan={24} className="px-2 text-[11px] text-muted-foreground">No previous changes</td>
+              </tr>
+            )}
+            {expanded && !loading && history.map((entry) => (
+              <tr key={entry.revision_id} className={`${ROW_H} border-b bg-muted/25 text-[11px] text-muted-foreground`}>
+                <td className="max-w-[200px] truncate px-2">{formatSparseAuditCell(entry, "sku_name")}</td>
+                <td className="border-l px-2">{formatSparseAuditCell(entry, "bucket")}</td>
+                <td className="px-2">{formatSparseAuditCell(entry, "subcategory")}</td>
+                <td className="px-2 text-right tabular-nums">{formatSparseAuditCell(entry, "cf")}</td>
+                <td className="border-l px-2 text-right tabular-nums">{formatSparseAuditCell(entry, "demand_units")}</td>
+                <td className="px-2 text-right tabular-nums font-medium text-foreground">
+                  {entry.nlc != null
+                    ? `₹${Math.round(entry.nlc * row.demandUnits).toLocaleString()}`
+                    : ""}
+                </td>
+                <td className="px-2 text-right tabular-nums font-medium text-foreground">{formatSparseAuditCell(entry, "grn_price_per_kg")}</td>
+                <td className="px-2 text-right tabular-nums" />
+                <td className="px-2 text-right tabular-nums font-medium text-foreground">{formatSparseAuditCell(entry, "grn_price_per_unit")}</td>
+                <td className="px-2 text-right tabular-nums font-medium text-foreground">{formatSparseAuditCell(entry, "grn_diff")}</td>
+                <td className="px-2 text-right tabular-nums font-medium text-foreground">{formatSparseAuditCell(entry, "adjusted_grn")}</td>
+                <td className="border-l px-2 text-right tabular-nums font-medium text-foreground">{formatSparseAuditCell(entry, "blinkit_sp")}</td>
+                <td className="px-2" />
+                <td className="px-2 text-right tabular-nums font-medium text-foreground">{formatSparseAuditCell(entry, "quoted_pp")}</td>
+                <td className="px-2 text-right tabular-nums font-medium text-foreground">
+                  {formatAuditGrnMarkup(entry, row.quotedPp, calc.grnPerUnit)}
+                </td>
+                <td className="px-2 text-right tabular-nums font-medium text-foreground">{formatSparseAuditCell(entry, "negotiated_pp")}</td>
+                <td className="px-2" />
+                <td className="px-2 text-right tabular-nums font-medium text-foreground">{formatSparseAuditCell(entry, "nlc")}</td>
+                <td className="px-2 text-right tabular-nums font-medium text-foreground">{formatSparseAuditCell(entry, "pi_pct")}</td>
+                <td className="px-2 text-right tabular-nums font-medium text-foreground">{formatSparseAuditCell(entry, "gm")}</td>
+                <td className="px-2 text-right tabular-nums font-medium text-foreground">{formatSparseAuditCell(entry, "deflection_pct")}</td>
+                <td className="px-2 text-right tabular-nums font-medium text-foreground">{formatSparseAuditCell(entry, "impact_pp_diff")}</td>
+                <td className="px-2 text-right tabular-nums font-medium text-foreground">{formatSparseAuditCell(entry, "impact_gm")}</td>
+                <td className="px-2 text-right tabular-nums font-medium text-foreground">{formatSparseAuditCell(entry, "bk_value_mix")}</td>
+              </tr>
+            ))}
+            </Fragment>
           );
         })}
       </tbody>
@@ -1996,6 +2481,351 @@ function unlockOnEdit(
       queueMicrotask(() => e.currentTarget.focus());
     }
   };
+}
+
+type QuotedPpFormulaKind = "higher_grn" | "target_nlc" | "margin_vs_grn";
+
+const QUOTED_PP_FORMULA_OPTIONS: {
+  id: QuotedPpFormulaKind;
+  label: string;
+  inputLabel: string;
+  requirePositive: boolean;
+}[] = [
+  {
+    id: "higher_grn",
+    label: "Show a higher GRN price to FK",
+    inputLabel: "Higher GRN price to show FK",
+    requirePositive: true,
+  },
+  {
+    id: "target_nlc",
+    label: "Target a specific NLC",
+    inputLabel: "Target NLC",
+    requirePositive: true,
+  },
+  {
+    id: "margin_vs_grn",
+    label: "Set a margin/loss vs GRN (per kg)",
+    inputLabel: "Margin per kg X (+ extra / − loss)",
+    requirePositive: false,
+  },
+];
+
+type QuotedPpFormulaRow = Pick<
+  SkuRow,
+  "conversionFactor" | "grnPricePerKg" | "processingCost" | "packagingCost" | "fmlCost"
+>;
+
+function computeQuotedPpFromFormula(
+  kind: QuotedPpFormulaKind,
+  x: number,
+  row: QuotedPpFormulaRow,
+): { value: number } | { error: string } {
+  switch (kind) {
+    case "higher_grn":
+      return { value: x * row.conversionFactor };
+    case "target_nlc":
+      return {
+        value: x - (row.processingCost + row.packagingCost + row.fmlCost),
+      };
+    case "margin_vs_grn":
+      if (row.grnPricePerKg === null) {
+        return { error: "GRN/kg is unavailable for this row" };
+      }
+      // Quoted PP = (GRN/kg + X) * CF. X is signed: 2 adds ₹2/kg, -2 subtracts ₹2/kg.
+      return { value: (row.grnPricePerKg + x) * row.conversionFactor };
+  }
+}
+
+function roundQuotedPp(v: number): number {
+  return Math.round(v * 100) / 100;
+}
+
+/** Resolve Quoted PP from user-entered X. Only Quoted PP changes — other row fields are inputs to the formula. */
+function resolveQuotedPpFromX(
+  kind: QuotedPpFormulaKind,
+  raw: string,
+  row: QuotedPpFormulaRow,
+): { value: number } | { error: string } {
+  const option = QUOTED_PP_FORMULA_OPTIONS.find((o) => o.id === kind);
+  if (!option) return { error: "Select a formula" };
+
+  if (raw.trim() === "" || raw === "-" || raw === "." || raw === "-.") {
+    return { error: "Enter a value for X" };
+  }
+
+  const x = parseFloat(raw);
+  if (!Number.isFinite(x)) {
+    return { error: "Enter a valid number" };
+  }
+
+  if (option.requirePositive && x <= 0) {
+    return { error: "Must be a positive number" };
+  }
+
+  const result = computeQuotedPpFromFormula(kind, x, row);
+  if ("error" in result) return result;
+
+  if (result.value < 0) {
+    return { error: "Quoted PP would be negative" };
+  }
+
+  return { value: roundQuotedPp(result.value) };
+}
+
+const FORMULA_PANEL_WIDTH = 288;
+const FORMULA_PANEL_GAP = 6;
+const FORMULA_PANEL_PADDING = 12;
+
+function useFormulaPanelPosition(
+  open: boolean,
+  anchorRef: React.RefObject<HTMLElement | null>,
+  panelRef: React.RefObject<HTMLElement | null>,
+  layoutKey: string,
+) {
+  const [style, setStyle] = useState<CSSProperties>({ visibility: "hidden" });
+
+  useLayoutEffect(() => {
+    if (!open || !anchorRef.current) return;
+
+    const update = () => {
+      const anchor = anchorRef.current;
+      const panel = panelRef.current;
+      if (!anchor) return;
+
+      const rect = anchor.getBoundingClientRect();
+      const panelHeight = panel?.offsetHeight ?? 220;
+      const viewportW = window.innerWidth;
+      const viewportH = window.innerHeight;
+
+      let top = rect.bottom + FORMULA_PANEL_GAP;
+      if (top + panelHeight > viewportH - FORMULA_PANEL_PADDING) {
+        top = Math.max(FORMULA_PANEL_PADDING, rect.top - panelHeight - FORMULA_PANEL_GAP);
+      }
+
+      let left = rect.right - FORMULA_PANEL_WIDTH;
+      left = Math.max(
+        FORMULA_PANEL_PADDING,
+        Math.min(left, viewportW - FORMULA_PANEL_WIDTH - FORMULA_PANEL_PADDING),
+      );
+
+      setStyle({
+        position: "fixed",
+        top,
+        left,
+        width: FORMULA_PANEL_WIDTH,
+        zIndex: 100,
+        visibility: "visible",
+      });
+    };
+
+    update();
+    window.addEventListener("scroll", update, true);
+    window.addEventListener("resize", update);
+
+    const panel = panelRef.current;
+    const ro = panel ? new ResizeObserver(update) : null;
+    ro?.observe(panel);
+
+    return () => {
+      window.removeEventListener("scroll", update, true);
+      window.removeEventListener("resize", update);
+      ro?.disconnect();
+    };
+  }, [open, anchorRef, panelRef, layoutKey]);
+
+  return style;
+}
+
+function QuotedPpFormulaButton({
+  row,
+  disabled,
+  locked,
+  onUnlock,
+  onApply,
+}: {
+  row: QuotedPpFormulaRow;
+  disabled?: boolean;
+  locked: boolean;
+  onUnlock: () => void;
+  onApply: (quotedPp: number) => void;
+}) {
+  const [open, setOpen] = useState(false);
+  const [kind, setKind] = useState<QuotedPpFormulaKind | null>(null);
+  const [draft, setDraft] = useState("");
+  const [error, setError] = useState<string | null>(null);
+  const anchorRef = useRef<HTMLButtonElement | null>(null);
+  const panelRef = useRef<HTMLDivElement | null>(null);
+
+  const selected = QUOTED_PP_FORMULA_OPTIONS.find((o) => o.id === kind) ?? null;
+
+  const reset = () => {
+    setKind(null);
+    setDraft("");
+    setError(null);
+  };
+
+  const close = () => {
+    setOpen(false);
+    reset();
+  };
+
+  const panelStyle = useFormulaPanelPosition(
+    open,
+    anchorRef,
+    panelRef,
+    `${kind ?? "select"}:${error ?? ""}`,
+  );
+
+  useEffect(() => {
+    if (!open) return;
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.key === "Escape") close();
+    };
+    const onPointerDown = (e: MouseEvent) => {
+      const target = e.target;
+      if (!(target instanceof Node)) return;
+      if (anchorRef.current?.contains(target)) return;
+      if (panelRef.current?.contains(target)) return;
+      close();
+    };
+    window.addEventListener("keydown", onKeyDown);
+    window.addEventListener("mousedown", onPointerDown);
+    return () => {
+      window.removeEventListener("keydown", onKeyDown);
+      window.removeEventListener("mousedown", onPointerDown);
+    };
+  }, [open]);
+
+  const handleDraftChange = (raw: string) => {
+    setDraft(raw);
+    if (error) setError(null);
+  };
+
+  const handleApply = () => {
+    if (!kind) return;
+    const resolved = resolveQuotedPpFromX(kind, draft, row);
+    if ("error" in resolved) {
+      setError(resolved.error);
+      return;
+    }
+    if (locked) onUnlock();
+    onApply(resolved.value);
+    close();
+  };
+
+  const panel = open ? (
+    <div
+      ref={panelRef}
+      style={panelStyle}
+      className="rounded-md border bg-popover p-3 text-popover-foreground shadow-md outline-none"
+      onWheel={(e) => e.stopPropagation()}
+    >
+      {kind === null || !selected ? (
+        <div className="space-y-2">
+          <p className="text-[11px] font-semibold uppercase tracking-wide text-muted-foreground">
+            Apply Formula
+          </p>
+          <div className="flex flex-col gap-1">
+            {QUOTED_PP_FORMULA_OPTIONS.map((opt) => (
+              <button
+                key={opt.id}
+                type="button"
+                onClick={() => {
+                  setKind(opt.id);
+                  setDraft("");
+                  setError(null);
+                }}
+                className="rounded-sm border border-input bg-card px-2.5 py-2 text-left text-[12px] leading-snug text-foreground hover:bg-accent"
+              >
+                {opt.label}
+              </button>
+            ))}
+          </div>
+          <div className="flex justify-end pt-1">
+            <button
+              type="button"
+              onClick={close}
+              className="h-7 rounded-sm border border-input bg-card px-2.5 text-[12px] text-muted-foreground hover:text-foreground"
+            >
+              Cancel
+            </button>
+          </div>
+        </div>
+      ) : (
+        <div className="space-y-2">
+          <button
+            type="button"
+            onClick={reset}
+            className="inline-flex items-center gap-0.5 text-[11px] text-muted-foreground hover:text-foreground"
+          >
+            <ChevronLeft className="h-3 w-3" />
+            Back
+          </button>
+          <p className="text-[11px] font-medium text-foreground">{selected.label}</p>
+          <label className="block space-y-1">
+            <span className="text-[11px] text-muted-foreground">{selected.inputLabel}</span>
+            <input
+              type="number"
+              step="any"
+              autoFocus
+              value={draft}
+              onChange={(e) => handleDraftChange(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === "Enter") {
+                  e.preventDefault();
+                  handleApply();
+                }
+              }}
+              className={`h-8 w-full rounded-sm border px-2 text-right text-[12px] tabular-nums outline-none focus:border-primary ${
+                error ? "border-destructive bg-destructive/5" : "border-input bg-card"
+              }`}
+              placeholder="Enter X"
+            />
+          </label>
+          {error && (
+            <p className="text-[11px] text-destructive" role="alert">
+              {error}
+            </p>
+          )}
+          <div className="flex items-center justify-end gap-1.5 pt-1">
+            <button
+              type="button"
+              onClick={close}
+              className="h-7 rounded-sm border border-input bg-card px-2.5 text-[12px] text-muted-foreground hover:text-foreground"
+            >
+              Cancel
+            </button>
+            <button
+              type="button"
+              onClick={handleApply}
+              className="h-7 rounded-sm border border-primary/30 bg-primary px-2.5 text-[12px] font-medium text-primary-foreground hover:bg-primary/90"
+            >
+              Apply
+            </button>
+          </div>
+        </div>
+      )}
+    </div>
+  ) : null;
+
+  return (
+    <>
+      <button
+        ref={anchorRef}
+        type="button"
+        disabled={disabled}
+        title="Apply Formula"
+        aria-label="Apply Formula"
+        aria-expanded={open}
+        onClick={() => (open ? close() : setOpen(true))}
+        className="grid h-6 w-6 shrink-0 place-items-center rounded-sm border border-input bg-card text-muted-foreground hover:text-foreground disabled:cursor-not-allowed disabled:opacity-40"
+      >
+        <Calculator className="h-3 w-3" />
+      </button>
+      {typeof document !== "undefined" && panel ? createPortal(panel, document.body) : null}
+    </>
+  );
 }
 
 function LockedPriceInput({
@@ -2239,19 +3069,54 @@ function UploadPanel({ kind }: { kind: "demand" | "sku" }) {
 
         if (payload.length === 0) throw new Error("No valid rows found in CSV");
 
+        // Prefer MySQL FSN → WeightUnitName as the weight_unit source of truth.
+        const byCity = new Map<string, string[]>();
+        for (const p of payload) {
+          const c = String(p.city ?? "");
+          const fsn = String(p.fsn_id ?? "").trim();
+          if (!c || !fsn) continue;
+          const list = byCity.get(c) ?? [];
+          list.push(fsn);
+          byCity.set(c, list);
+        }
+        const cityMaps = new Map<string, Record<string, string>>();
+        for (const [c, fsns] of byCity) {
+          try {
+            cityMaps.set(c, await loadFsnWeightUnitMap(fsns, c));
+          } catch (e) {
+            console.warn(`MySQL weight-unit lookup failed for ${c}:`, e);
+            cityMaps.set(c, {});
+          }
+        }
+        for (const p of payload) {
+          const c = String(p.city ?? "");
+          const key = fsnWeightKey(String(p.fsn_id ?? ""));
+          const fromMysql = cityMaps.get(c)?.[key];
+          if (fromMysql) p.weight_unit = fromMysql;
+        }
+
         const chunk = 500;
         let inserted = 0;
-        for (let i = 0; i < payload.length; i += chunk) {
-          const slice = payload.slice(i, i + chunk);
-          const { error, count } = await supabase
-            .from("pricing_sheet")
-            .upsert(slice, { onConflict: "delivery_date,city,sku_id,weight_unit", count: "exact" });
-          if (error) throw error;
-          inserted += count ?? slice.length;
+        const bySheet = new Map<string, Partial<PricingSheetRow>[]>();
+        for (const p of payload) {
+          const key = `${p.delivery_date}||${p.city}`;
+          const list = bySheet.get(key) ?? [];
+          list.push(p);
+          bySheet.set(key, list);
+        }
+        for (const [key, rows] of bySheet) {
+          const [dd, c] = key.split("||");
+          const detailRows = rows.map(({ delivery_date: _d, city: _c, city_id: _ci, ...rest }) => rest);
+          for (let i = 0; i < detailRows.length; i += chunk) {
+            const slice = detailRows.slice(i, i + chunk);
+            inserted += await upsertDemandUploadRows(c, dd, slice);
+          }
         }
         toast.success(`Demand uploaded — ${inserted} rows`);
       } else {
-        toast.success("SKU configuration uploaded successfully");
+        const text = await file.text();
+        const count = await upsertFsnCostComponentsFromCsv(text, city || undefined);
+        toast.success(`FSN cost components saved — ${count} rows`);
       }
       setFile(null);
     } catch (e) {
@@ -2362,7 +3227,7 @@ function UploadPanel({ kind }: { kind: "demand" | "sku" }) {
         {uploading ? (
           <>
             <span className="h-4 w-4 animate-spin rounded-full border-2 border-white border-t-transparent" />
-            Uploading...
+            Uploading…
           </>
         ) : (
           <>
@@ -2370,6 +3235,20 @@ function UploadPanel({ kind }: { kind: "demand" | "sku" }) {
           </>
         )}
       </button>
+
+      {uploading && (
+        <div className="mb-3 flex items-center gap-3 rounded-md border border-primary/20 bg-muted/40 px-4 py-4">
+          <span className="h-4 w-4 shrink-0 animate-spin rounded-full border-2 border-primary border-t-transparent" />
+          <div>
+            <p className="text-[13px] font-medium text-foreground">
+              {kind === "demand" ? "Uploading demand file…" : "Uploading SKU configuration…"}
+            </p>
+            <p className="mt-0.5 text-[12px] text-muted-foreground">
+              Saving rows{kind === "demand" ? " and resolving weight units" : ""} — please wait.
+            </p>
+          </div>
+        </div>
+      )}
 
       {/* Download sample */}
       <button
@@ -2477,10 +3356,35 @@ function SkuConfigTab() {
 
   const canFetch = selectedSkus.length > 0;
 
-  const onFetch = () => {
+  const onFetch = async () => {
     const rows = store.filter((o) => selectedSkus.includes(o.id));
-    setFetched(rows);
-    setPage(1);
+    const fsns = rows.map((r) => r.fsnId);
+    try {
+      const costs = await fetchFsnCostComponentsByFsns(fsns);
+      const byFsn = new Map<string, typeof costs>();
+      for (const c of costs) {
+        const list = byFsn.get(c.fsn_id) ?? [];
+        list.push(c);
+        byFsn.set(c.fsn_id, list);
+      }
+      const merged = rows.map((r) => {
+        const matches = byFsn.get(r.fsnId) ?? [];
+        const hit = matches[0];
+        if (!hit) return r;
+        return {
+          ...r,
+          weightUnit: hit.weight_unit,
+          pmCost: hit.pm_cost ?? 0,
+          fmlDump: hit.fml_dump ?? 0,
+          processingCost: hit.pc ?? 0,
+        };
+      });
+      setFetched(merged);
+      setPage(1);
+    } catch (e) {
+      const { toast } = await import("sonner");
+      toast.error(`Fetch failed: ${(e as Error).message}`);
+    }
   };
 
   const onChooseFile = () => fileRef.current?.click();
@@ -2499,8 +3403,7 @@ function SkuConfigTab() {
     if (!canUpload || !file) return;
     setUploading(true);
     const text = await file.text();
-    await new Promise((r) => setTimeout(r, 1500));
-    // Parse CSV and merge changes by SKU ID
+    const { toast } = await import("sonner");
     try {
       const lines = text.split(/\r?\n/).filter(Boolean);
       const header = lines[0].split(",").map((h) => h.trim());
@@ -2528,13 +3431,19 @@ function SkuConfigTab() {
       }
       setStore((prev) => prev.map((r) => (updates.has(r.id) ? { ...r, ...updates.get(r.id)! } : r)));
       setFetched((prev) => prev.map((r) => (updates.has(r.id) ? { ...r, ...updates.get(r.id)! } : r)));
-    } catch {
-      /* ignore parse errors in prototype */
+
+      const parsed = parseFsnCostCsvRows(text);
+      if (parsed.length === 0) {
+        throw new Error("CSV must include FSN ID and cost columns");
+      }
+      const count = await upsertFsnCostComponentsFromCsv(text, city || undefined);
+      toast.success(`Saved ${count} FSN cost component rows`);
+    } catch (e) {
+      toast.error(`Upload failed: ${(e as Error).message}`);
+    } finally {
+      setUploading(false);
+      setFile(null);
     }
-    setUploading(false);
-    const { toast } = await import("sonner");
-    toast.success("Changes have been saved");
-    setFile(null);
   };
 
   const canExport = fetched.length > 0;
